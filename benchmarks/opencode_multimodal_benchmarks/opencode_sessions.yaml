@@ -21,6 +21,12 @@ visual_environment:
   environment_servers:
     single_agent_turn:
       entrypoint: opencode.py
+      resources_server:
+        type: resources_servers
+        name: opencode_multimodal_benchmarks
+      agent_server:
+        type: responses_api_agents
+        name: visual_agent
       host: 127.0.0.1
       cleanup_timeout_seconds: 180
       agent_outcome_policy:
