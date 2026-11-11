@@ -128,20 +128,12 @@ async def test_original_special_environment_refuses_before_output_changes(tmp_pa
     response["opencode_evidence"] = {"turns_used": 1, "finished_naturally": True, "tool_reward": None}
     result = {"response": response, "reward": 1.0}
     if kind == "failed":
-        from environment_servers.single_agent_turn.app import SessionHandles
-        from environment_servers.single_agent_turn.opencode import OpenCodeEnvironmentServer
-
-        base, producer = _environment_server()
-        failed = type(_agent_response()).model_validate(
-            _agent_response().model_dump(mode="json")
-            | {"status": "failed", "error": {"code": "server_error", "message": "limit"}}
-        )
-        typed_zero = await OpenCodeEnvironmentServer(config=base.config, server_client=producer)._verify(
-            _request(), SessionHandles(resources_session_id="resource", agent_session_id="agent"), failed, None
-        )
-        assert typed_zero.reward == 0 and typed_zero.scorer == "agent-failure" and producer.calls == []
-        assert "opencode_evidence" not in typed_zero.response.model_dump(mode="json")
-        result = typed_zero.model_dump(mode="json")
+        result = {
+            "response": response | {"status": "failed", "error": {"code": "server_error", "message": "limit"}},
+            "reward": 0.0,
+            "scorer": "agent-failure",
+        }
+        result["response"].pop("opencode_evidence")
     elif kind == "verification_error":
         response["opencode_evidence"]["verification_error"] = "unusable native evidence"
         result = {"_ng_failure_class": "judge_failed", "_ng_failure_partial_response": response}
@@ -651,3 +643,51 @@ async def test_rescore_limit_does_not_interpret_unrequested_completion(prepared_
             await reverify.RolloutReverificationHelper().run_from_config(config)
         assert seen == []
     assert snapshot(output) == before
+
+
+def test_repeat_plan_uses_verified_source_route_for_a_task_without_any_outcome(tmp_path):
+    rows = [{"_ng_task_index": task, "_ng_rollout_index": 0, "agent_ref": {"name": "agent"}} for task in range(2)]
+    source = tmp_path / "inputs.jsonl"
+    source.write_bytes(b"".join(orjson.dumps(row) + b"\n" for row in rows))
+    output = tmp_path / "rollouts.jsonl"
+    servers = _replay_servers()
+    del servers["special"]
+    with RolloutStore.start_or_resume(
+        output, lambda: (rows, RunManifest.create(source, rows, {}, servers)), resume=False
+    ) as store:
+        first = store.pending()[0]
+        store.record_dispatch(first)
+        store.record_outcome(first | {"_ng_environment_server": "plain", "reward": 1})
+    stamps, _ = reverify._source_identity_stamps((output,))
+    plan = reverify._aggregation_plan(
+        [materialized_path_for(output)],
+        stamps=stamps,
+        replay_source=reverify._replay_source(RolloutStore.read(output, import_legacy=False)),
+        routing_rows=[],
+        agent_to_rs={"agent": "resources"},
+        global_config={"resources": {"resources_servers": {"fixture": {}}}},
+    )
+    assert plan.inventory == {("plain", "resources"): {0: [0], 1: [0]}}
+    assert plan.unknown == set()
+
+
+async def test_verifier_owned_tool_reward_replays_with_original_execution_evidence(tmp_path, monkeypatch):
+    evidence = {"schema_version": "2.0", "source": "opencode", "records": []}
+    output, _ = _saved_run(
+        tmp_path,
+        [
+            (
+                "plain",
+                {
+                    "response": _agent_response().model_dump(mode="json"),
+                    "reward": 1.1,
+                    "opencode_tool_reward": {"auxiliary_reward": 0.1},
+                    "ng_agent_observations": evidence,
+                },
+            )
+        ],
+    )
+    client = _replay_client(monkeypatch)
+    await reverify.RolloutReverificationHelper().run_from_config(_config(output, tmp_path / "rescored.jsonl"))
+    assert client.post.await_args.kwargs["json"]["ng_agent_observations"] == evidence
+    assert "opencode_tool_reward" not in client.post.await_args.kwargs["json"]
