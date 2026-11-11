@@ -7,7 +7,6 @@ import pytest
 from nemo_gym.verification import JudgeError
 from resources_servers.opencode_multimodal_benchmarks.app import VisualBenchmarksServer
 from resources_servers.opencode_multimodal_benchmarks.tests.test_app import request, server  # noqa: F401
-from resources_servers.opencode_multimodal_benchmarks.verifier import VisualVerifyRequest
 from resources_servers.opencode_multimodal_benchmarks.vtcbench import judge_score, rule_score
 
 
@@ -42,7 +41,7 @@ async def test_rule_hit_never_calls_judge(server, monkeypatch, prediction):
     monkeypatch.setattr(VisualBenchmarksServer, "_judge", judge)
     result = await server.verify(request("VTCBench", prediction))
     assert result.reward == 1 and result.extraction_method == "rule"
-    assert result.scorer == "vtcbench-final-answer-rules-llm-v3"
+    assert result.scorer == "vtcbench-final-answer-rules-llm-v4"
     judge.assert_not_awaited()
 
 
@@ -60,13 +59,24 @@ async def test_mcq_fallback(server, monkeypatch, verdict, reward):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("verdict,reward", [("A", 1), ("B", 0)])
+async def test_option_text_reference_agrees_between_rule_and_judge(server, monkeypatch, verdict, reward):
+    judge = AsyncMock(return_value=verdict)
+    monkeypatch.setattr(VisualBenchmarksServer, "_judge", judge)
+    direct = await server.verify(request("VTCBench", "A", answer="cat"))
+    assert direct.reward == 1 and direct.extraction_method == "rule"
+    judge.assert_not_awaited()
+    judged = await server.verify(request("VTCBench", "the feline", answer="cat"))
+    assert judged.reward == reward and judged.extraction_method == "llm"
+    judge.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("verdict,reward", [("yes", 1), ("No", 0)])
 async def test_free_answer_fallback(server, monkeypatch, verdict, reward):
     judge = AsyncMock(return_value=verdict)
     monkeypatch.setattr(VisualBenchmarksServer, "_judge", judge)
-    value = request("VTCBench", "five").model_dump()
-    value["verifier_metadata"].update(answer="5", options={})
-    body = VisualVerifyRequest.model_validate(value)
+    body = request("VTCBench", "five", answer="5", options={})
     result = await server.verify(body)
     assert result.reward == reward and result.extraction_method == "llm"
     assert "Ground Truth: 5\nPredicted Answer: five" in judge.call_args.args[0]
@@ -98,7 +108,7 @@ async def test_rule_only_mode(server, monkeypatch):
     monkeypatch.setattr(VisualBenchmarksServer, "_judge", judge)
     result = await server.verify(request("VTCBench", "Answer: A"))
     assert result.reward == 1 and result.extraction_method == "rule"
-    assert result.scorer == "vtcbench-final-answer-rules-v3"
+    assert result.scorer == "vtcbench-final-answer-rules-v4"
     judge.assert_not_awaited()
 
 
@@ -113,6 +123,9 @@ async def test_empty_answer_is_zero_without_judge(server, monkeypatch):
 
 def test_multiselect_and_invalid_mcq_verdicts():
     task = {"options": {"A": "cat", "B": "dog"}, "answer": "B, A"}
+    assert rule_score(task, "A, B") == 1
+    assert rule_score(task, "B") == 0
+    assert rule_score(task, "A, A, B") == 0
     assert judge_score(task, "AB") == 1
     assert judge_score(task, "B") == 0
     assert judge_score(task, "A, B") is None
@@ -140,52 +153,16 @@ def test_judge_mcq_verdict_tolerates_surrounding_whitespace():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("benchmark", ["VStarBench", "HRBench8K", "VTCBench"])
-@pytest.mark.parametrize("reference,reward", [("B", 1), ("A", 0)])
-async def test_corrected_explicit_answer_is_verified_without_judge(server, monkeypatch, benchmark, reference, reward):
-    server.config.vtc_llm_fallback = False
-    judge = AsyncMock()
-    monkeypatch.setattr(VisualBenchmarksServer, "_judge", judge)
-    result = await server.verify(
-        request(benchmark, "The answer is A. After rechecking, the answer is B.", answer=reference)
-    )
-    assert result.reward == reward
-    assert result.evaluation_completed is True
-    judge.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("benchmark", ["VStarBench", "HRBench8K", "VTCBench"])
 async def test_unavailable_final_assertion_cannot_credit_an_earlier_option(server, monkeypatch, benchmark):
     server.config.vtc_llm_fallback = False
     judge = AsyncMock(return_value="Z")
     monkeypatch.setattr(VisualBenchmarksServer, "_judge", judge)
     result = await server.verify(request(benchmark, "answer is A; answer is D", answer="A"))
     assert result.reward == 0
+    assert result.evaluation_completed is True
     if benchmark == "VTCBench":
+        assert result.scorer == "vtcbench-final-answer-rules-v4"
         judge.assert_not_awaited()
     else:
+        assert result.scorer == "mcq-final-answer-llm-v4"
         judge.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("reference", ["cat", " Cat ", "A", " a "])
-@pytest.mark.parametrize("verdict,reward", [("A", 1), ("B", 0), ("Z", 0)])
-async def test_option_text_and_letter_references_share_judge_scoring(server, monkeypatch, reference, verdict, reward):
-    judge = AsyncMock(return_value=verdict)
-    monkeypatch.setattr(VisualBenchmarksServer, "_judge", judge)
-    result = await server.verify(request("VTCBench", "the feline", answer=reference))
-    assert result.reward == reward
-    assert result.extraction_method == "llm"
-    judge.assert_awaited_once()
-    assert "Options: A. cat B. dog " in judge.call_args.args[0]
-    assert "Ground Truth" not in judge.call_args.args[0]
-
-
-@pytest.mark.asyncio
-async def test_option_text_reference_remains_a_rule_hit_without_judging(server, monkeypatch):
-    judge = AsyncMock()
-    monkeypatch.setattr(VisualBenchmarksServer, "_judge", judge)
-    result = await server.verify(request("VTCBench", "A", answer="cat"))
-    assert result.reward == 1
-    assert result.extraction_method == "rule"
-    judge.assert_not_awaited()

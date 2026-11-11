@@ -10,7 +10,7 @@
 import re
 
 
-MCQ_SCORER = "mcq-final-answer-llm-v3"
+MCQ_SCORER = "mcq-final-answer-llm-v4"
 _VERBOSE_ANSWER = re.compile(r"(?i:(?:correct\s+)?answer\s+is\s+)\**([A-Z])\b\**")
 
 
@@ -33,9 +33,9 @@ def infer_option(prediction: str, choices: dict[str, str]) -> str | None:
         )
         if any(message in answer for message in rejections):
             return "Z"
-        assertions = list(_VERBOSE_ANSWER.finditer(answer))
-        if assertions:
-            selected = assertions[-1].group(1)
+        matches = list(_VERBOSE_ANSWER.finditer(answer))
+        if matches:
+            selected = matches[-1].group(1)
             return selected if selected in choices else None
         modified = answer
         for char in ".()[],:;!*#{}":

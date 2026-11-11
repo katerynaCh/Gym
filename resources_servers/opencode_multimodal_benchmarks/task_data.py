@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Task-owned fields shared by the four visual benchmark datasets."""
 
+import re
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -10,21 +11,17 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 MetadataString = Annotated[str, Field(json_schema_extra={"legacy_location": "verifier_metadata"})]
 
 
-def normalize_reference(answer: str, options: dict[str, str]) -> str:
-    """Resolve VTC MCQ references to letters while keeping free answers as text."""
-    reference = answer.strip()
-    if not reference:
-        raise ValueError("VTCBench requires a nonempty reference answer")
-    if not options:
-        return reference
-    if len(reference) == 1 and reference.upper() in options:
-        return reference.upper()
-    letters = [part.strip().upper() for part in reference.split(",")]
-    if len(letters) > 1 and all(letter in options for letter in letters):
+def reference_options(answer: str, options: dict[str, str]) -> str:
+    """Resolve an MCQ reference to sorted letters without guessing ambiguous option text."""
+    answer = answer.strip()
+    if re.fullmatch(r"[A-Ga-g](?:\s*,\s*[A-Ga-g])*", answer):
+        letters = [letter.strip().upper() for letter in answer.split(",")]
+        if len(set(letters)) != len(letters) or any(letter not in options for letter in letters):
+            raise ValueError("VTCBench reference must select distinct available options")
         return "".join(sorted(letters))
-    matches = [letter for letter, text in options.items() if text.strip().casefold() == reference.casefold()]
+    matches = [letter for letter, text in options.items() if text.strip().casefold() == answer.casefold()]
     if len(matches) != 1:
-        raise ValueError("VTCBench reference must identify available option letters or exactly one option text")
+        raise ValueError("VTCBench reference text must match exactly one option")
     return matches[0]
 
 
@@ -69,6 +66,8 @@ class TaskData(BaseModel):
                 raise ValueError("MCQ option text must be nonempty")
         if self.benchmark == "HRBench8K" and not self.cycle_category.strip():
             raise ValueError("HRBench8K requires cycle_category")
-        if self.benchmark == "VTCBench":
-            normalize_reference(self.answer, self.options)
+        if self.benchmark == "VTCBench" and self.options:
+            if any(key not in "ABCDEFG" or len(key) != 1 or not value.strip() for key, value in self.options.items()):
+                raise ValueError("VTCBench options require letters A-G and nonempty text")
+            reference_options(self.answer, self.options)
         return self
