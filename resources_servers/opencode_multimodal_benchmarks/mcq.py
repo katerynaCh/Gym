@@ -33,6 +33,10 @@ def infer_option(prediction: str, choices: dict[str, str]) -> str | None:
         )
         if any(message in answer for message in rejections):
             return "Z"
+        assertions = list(_VERBOSE_ANSWER.finditer(answer))
+        if assertions:
+            selected = assertions[-1].group(1)
+            return selected if selected in choices else None
         modified = answer
         for char in ".()[],:;!*#{}":
             modified = modified.replace(char, " ")
@@ -42,9 +46,6 @@ def infer_option(prediction: str, choices: dict[str, str]) -> str | None:
             return letters[0]
         if not letters and "Z" in tokens:
             return "Z"
-        match = _VERBOSE_ANSWER.search(answer)
-        if match and match.group(1).upper() in choices:
-            return match.group(1).upper()
     if len(answer) <= 2 * sum(len(str(value)) for value in choices.values()):
         matches = [letter for letter, value in choices.items() if str(value).lower() in answer.lower()]
         if len(matches) == 1:

@@ -14,6 +14,7 @@ from resources_servers.opencode_multimodal_benchmarks.reporting import benchmark
 from resources_servers.opencode_multimodal_benchmarks.task_data import TaskData
 from resources_servers.opencode_multimodal_benchmarks.tests.test_app import request, server  # noqa: F401
 from resources_servers.opencode_multimodal_benchmarks.verifier import VisualVerifyRequest
+from resources_servers.opencode_multimodal_benchmarks.vtcbench import judge_score, rule_score
 
 
 BENCHMARKS = ("VStarBench", "HRBench8K", "VTCBench", "ZeroBench")
@@ -211,3 +212,34 @@ def test_mcq_wire_metadata_rejects_missing_required_fields(field):
     value["verifier_metadata"].pop(field)
     with pytest.raises(ValidationError):
         VisualVerifyRequest.model_validate(value)
+
+
+@pytest.mark.parametrize(
+    "answer,options",
+    [
+        ("cat", {"A": "cat", "B": " Cat "}),
+        ("feline", {"A": "cat", "B": "dog"}),
+        ("A, C", {"A": "cat", "B": "dog"}),
+    ],
+)
+def test_vtc_wire_boundary_rejects_ambiguous_or_unmapped_references(answer, options):
+    metadata = _minimal_metadata("VTCBench") | {"answer": answer, "options": options}
+    with pytest.raises(ValidationError, match="VTCBench reference"):
+        _wire_request(metadata)
+
+
+@pytest.mark.parametrize("answer", ["A", " a ", "B, A", "cat", " Cat "])
+def test_vtc_wire_boundary_preserves_supported_reference_metadata(answer):
+    metadata = _minimal_metadata("VTCBench") | {"answer": answer, "options": {"A": "cat", "B": "dog"}}
+    body = _wire_request(metadata)
+    assert all(body.verifier_metadata[key] == value for key, value in metadata.items())
+
+
+def test_vtc_letter_reference_takes_precedence_over_option_text():
+    metadata = _minimal_metadata("VTCBench") | {"answer": "A", "options": {"A": "cat", "B": "A"}}
+    task = _wire_request(metadata).verifier_metadata
+    assert task["answer"] == "A"
+    assert rule_score(task, "A") == 1
+    assert rule_score(task, "B") == 0
+    assert judge_score(task, "A") == 1
+    assert judge_score(task, "B") == 0

@@ -27,6 +27,19 @@ def test_verbose_option_must_be_available_and_api_failure_not_salvaged():
     assert infer_option("Failed to obtain answer via API. The answer is B.", {"A": "cat", "B": "dog"}) is None
 
 
+@pytest.mark.parametrize(
+    "prediction,expected",
+    [
+        ("The answer is A. After rechecking, the answer is B.", "B"),
+        ("answer is A; answer is B", "B"),
+        ("answer is A; answer is D", None),
+        ("The answer is A. After rechecking the cat, the answer is D.", None),
+    ],
+)
+def test_last_explicit_option_supersedes_earlier_assertions(prediction, expected):
+    assert infer_option(prediction, {"A": "cat", "B": "dog"}) == expected
+
+
 @pytest.mark.parametrize("benchmark", ["VStarBench", "HRBench8K"])
 def test_mcq_pins_ids_labels_cycles_and_media(monkeypatch, tmp_path, benchmark):
     image = tmp_path / (hashlib.sha256(b"original").hexdigest() + ".png")

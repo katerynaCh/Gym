@@ -13,6 +13,7 @@ Source: https://github.com/zhuzil/VTC-Bench/blob/
 import re
 
 from resources_servers.opencode_multimodal_benchmarks.mcq import infer_option
+from resources_servers.opencode_multimodal_benchmarks.task_data import normalize_reference
 
 
 MCQ_PROMPT = (
@@ -85,15 +86,12 @@ def rule_score(task: dict, prediction: str) -> int:
     """Grade the selected final answer; ambiguous prose requires the judge."""
     prediction = final_answer_text(prediction)
     answer = str(task["answer"]).strip()
-    if not answer:
-        raise ValueError("VTCBench requires a nonempty reference answer")
     options = {key: str(value).strip() for key, value in task["options"].items() if key in "ABCDEFG"}
+    reference = normalize_reference(answer, options)
     if options:
         selected = infer_option(prediction, options)
-        if len(answer) == 1 and answer.upper() in options:
-            return int(selected == answer.upper())
-        if selected in options:
-            return int(options[selected].casefold() == answer.casefold())
+        if (len(answer) == 1 and answer.upper() in options) or selected in options:
+            return int(selected == reference)
     return int(" ".join(prediction.casefold().split()) == " ".join(answer.casefold().split()))
 
 
@@ -116,7 +114,7 @@ def judge_score(task: dict, verdict: str) -> int | None:
     if task["options"]:
         if not verdict.isupper() or not verdict.isalpha():
             return None
-        reference = "".join(sorted(str(task["answer"]).lower().split(", ")))
-        return int("".join(sorted(verdict.lower())) == reference)
+        reference = normalize_reference(str(task["answer"]), task["options"])
+        return int("".join(sorted(verdict)) == reference)
     verdict = verdict.strip().lower()
     return int(verdict == "yes") if verdict in ("yes", "no") else None

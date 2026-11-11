@@ -10,6 +10,24 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 MetadataString = Annotated[str, Field(json_schema_extra={"legacy_location": "verifier_metadata"})]
 
 
+def normalize_reference(answer: str, options: dict[str, str]) -> str:
+    """Resolve VTC MCQ references to letters while keeping free answers as text."""
+    reference = answer.strip()
+    if not reference:
+        raise ValueError("VTCBench requires a nonempty reference answer")
+    if not options:
+        return reference
+    if len(reference) == 1 and reference.upper() in options:
+        return reference.upper()
+    letters = [part.strip().upper() for part in reference.split(",")]
+    if len(letters) > 1 and all(letter in options for letter in letters):
+        return "".join(sorted(letters))
+    matches = [letter for letter, text in options.items() if text.strip().casefold() == reference.casefold()]
+    if len(matches) != 1:
+        raise ValueError("VTCBench reference must identify available option letters or exactly one option text")
+    return matches[0]
+
+
 class TaskData(BaseModel):
     """Flat schema; legacy rows carry these fields in verifier_metadata.
 
@@ -51,4 +69,6 @@ class TaskData(BaseModel):
                 raise ValueError("MCQ option text must be nonempty")
         if self.benchmark == "HRBench8K" and not self.cycle_category.strip():
             raise ValueError("HRBench8K requires cycle_category")
+        if self.benchmark == "VTCBench":
+            normalize_reference(self.answer, self.options)
         return self
