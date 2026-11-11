@@ -65,6 +65,14 @@ if TYPE_CHECKING:
     )
     from nemo_gym.models.token_capture.harness_notes import HARNESS_NOTES
     from nemo_gym.models.token_capture.harness_notes.base import HarnessNote
+    from nemo_gym.models.turn_budget import (
+        FINAL_MODEL_TURN_NOTICE,
+        ModelTurnBudget,
+        ModelTurnBudgetCapacityReached,
+        ModelTurnBudgetConfig,
+        ModelTurnLimitReached,
+        model_turn_limit_details,
+    )
 
 
 # What code outside the library, such as servers, imports from this package. Each name's submodule loads
@@ -76,9 +84,14 @@ _PUBLIC_API = {
     "CaptureStore": "model_call_capture",
     "ChatCompletionsConverter": "chat_completions_converter",
     "ExternalCaptureHandler": "token_capture.external_capture",
+    "FINAL_MODEL_TURN_NOTICE": "turn_budget",
     "HARNESS_NOTES": "token_capture.harness_notes",
     "HarnessNote": "token_capture.harness_notes.base",
     "ModelCallCaptureConfig": "model_call_capture",
+    "ModelTurnBudget": "turn_budget",
+    "ModelTurnBudgetCapacityReached": "turn_budget",
+    "ModelTurnBudgetConfig": "turn_budget",
+    "ModelTurnLimitReached": "turn_budget",
     "PROPAGATED_REFUSAL_CODE_ATTRIBUTE": "base_responses_api_model",
     "PolicyModelParticipant": "_checkpoint",
     "SimpleResponsesAPIModel": "base_responses_api_model",
@@ -94,6 +107,7 @@ _PUBLIC_API = {
     "is_responses_lifecycle_chunk": "responses_streaming",
     "make_external_capture_handler": "token_capture.external_capture",
     "message_content_to_text": "chat_completions_converter",
+    "model_turn_limit_details": "turn_budget",
     "note_generation_backend": "_checkpoint",
     "note_generation_request": "_checkpoint",
     "restore_namespace_tool_calls": "responses_streaming",

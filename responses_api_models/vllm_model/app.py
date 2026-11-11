@@ -19,6 +19,8 @@ import json
 import logging
 import os
 import re
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from copy import deepcopy
 from dataclasses import dataclass
 from threading import Lock
@@ -55,11 +57,16 @@ from nemo_gym.core import (
     model_call_sampling_config,
 )
 from nemo_gym.models import (
+    FINAL_MODEL_TURN_NOTICE,
     PROPAGATED_REFUSAL_CODE_ATTRIBUTE,
     BaseResponsesAPIModelConfig,
     Body,
     ChatCompletionsConverter,
     ExternalCaptureHandler,
+    ModelTurnBudget,
+    ModelTurnBudgetCapacityReached,
+    ModelTurnBudgetConfig,
+    ModelTurnLimitReached,
     SimpleResponsesAPIModel,
     VLLMConverter,  # noqa: F401  # re-exported for importers of this module
     VLLMConverterResponsesToChatCompletionsState,  # noqa: F401
@@ -81,6 +88,7 @@ from nemo_gym.models.token_capture import (
     CaptureContext,
     CaptureInputError,
     capture_engine_refusal,
+    capture_model_refusal,
     current_capture_context,
     reset_token_sink,
     resolve_parent,
@@ -489,6 +497,7 @@ class VLLMModelConfig(BaseResponsesAPIModelConfig):
     api_key: str
     model: str
     return_token_id_information: bool
+    turn_budget: ModelTurnBudgetConfig | None = None
     # Request inline prompt and generation token IDs from compatible vLLM endpoints.
     request_prompt_and_generation_token_ids: bool = False
     propagate_context_overflow_errors: bool = False
@@ -721,6 +730,15 @@ class VLLMModelConfig(BaseResponsesAPIModelConfig):
         return self
 
     @model_validator(mode="after")
+    def _validate_turn_budget(self) -> "VLLMModelConfig":
+        if self.turn_budget is not None:
+            if (self.num_workers or 1) != 1:
+                raise ValueError("turn_budget requires one model-server worker")
+            if self.use_completions_api or self.is_responses_native:
+                raise ValueError("turn_budget requires the chat-completions backend")
+        return self
+
+    @model_validator(mode="after")
     def _validate_custom_tool_strategy(self) -> "VLLMModelConfig":
         if self.custom_tool_strategy == "function_bridge" and self.is_responses_native:
             raise ValueError(
@@ -795,6 +813,7 @@ class VLLMModel(SimpleResponsesAPIModel):
     _warned_request_chat_template_kwargs_dropped: bool = PrivateAttr(default=False)
     _tar_audio_reader: TarAudioReader = PrivateAttr(default_factory=TarAudioReader)
     _generation_cut_control_urls: Dict[str, str] = PrivateAttr(default_factory=dict)
+    _turn_budget: ModelTurnBudget | None = PrivateAttr(default=None)
 
     def _validate_capture_request(
         self, body: NeMoGymResponseCreateParamsNonStreaming | NeMoGymChatCompletionCreateParamsNonStreaming
@@ -936,6 +955,18 @@ class VLLMModel(SimpleResponsesAPIModel):
         config = token_capture_config(self.server_client.global_config_dict)
         if config.token_id_capture.parent_resolution == "source_history":
             app.post("/context/measure")(self.measure_context)
+        if self._turn_budget is not None:
+            parent_lifespan = app.router.lifespan_context
+
+            @asynccontextmanager
+            async def lifespan(app: FastAPI) -> AsyncIterator[Any]:
+                try:
+                    async with parent_lifespan(app) as state:
+                        yield state
+                finally:
+                    self._turn_budget.close()
+
+            app.router.lifespan_context = lifespan
         return app
 
     async def measure_context(self, request: Request, body: dict = Body()) -> dict[str, int]:
@@ -1008,6 +1039,11 @@ class VLLMModel(SimpleResponsesAPIModel):
         return sorted(set(self.config.sampling_overrides or {}) - _REPORTING_ONLY_SAMPLING_OVERRIDES)
 
     def _post_init(self) -> None:
+        if self.config.turn_budget is not None:
+            self._turn_budget = ModelTurnBudget(
+                self.config.turn_budget,
+                global_config=getattr(self.server_client, "global_config_dict", None),
+            )
         if self.config.sampling_overrides:
             sampling_config = model_call_sampling_config(getattr(self.server_client, "global_config_dict", None))
             pins = self._sampling_pins()
@@ -1491,6 +1527,16 @@ class VLLMModel(SimpleResponsesAPIModel):
         self._splice_audio_from_metadata(body_dict, metadata)
 
         self._apply_sampling_overrides(body_dict, api="chat")
+        enforcement = getattr(request.state, "nemo_gym_model_turn_budget", None)
+        if isinstance(enforcement, dict):
+            # Clamp after caller/config overrides and before capture prepares the final request.
+            body_dict["n"] = 1
+            allowance = enforcement["allowance"]
+            if allowance is not None:
+                body_dict["parallel_tool_calls"] = False
+                body_dict["tool_choice"] = "none" if allowance == 0 else "auto"
+                if "function_call" in body_dict or "functions" in body_dict:
+                    body_dict["function_call"] = "none"
         self._validate_single_choice_token_request(body_dict)
         if self._external_capture_handler is not None:
             body_dict = self._external_capture_handler.prepare_request(body_dict)
@@ -1718,6 +1764,57 @@ class VLLMModel(SimpleResponsesAPIModel):
 
     async def chat_completions(
         self, request: Request, body: NeMoGymChatCompletionCreateParamsNonStreaming = Body()
+    ) -> NeMoGymChatCompletion:
+        budget = self._turn_budget
+        if budget is None:
+            return await self._chat_completions(request, body)
+        capture_key = current_rollout_id()
+        if not capture_key or body.n not in (None, 1):
+            raise HTTPException(400, "turn_budget requires an attempt-qualified rollout route and one completion")
+        try:
+            async with budget.next_turn(capture_key) as turn:
+                updates = {}
+                if turn.number >= budget.config.regular_turns:
+                    updates["messages"] = [*body.messages, {"role": "user", "content": FINAL_MODEL_TURN_NOTICE}]
+                request.state.nemo_gym_model_turn_budget = {"allowance": turn.tool_allowance}
+                response = await self._chat_completions(request, body.model_copy(update=updates))
+                if len(response.choices) != 1:
+                    raise ValueError("turn_budget requires exactly one returned completion")
+                execution = getattr(request.state, "nemo_gym_model_execution", {})
+                # Preserve stock synthetic rejections, including their finish reason. No successful turn was served.
+                if execution.get("response_source") == "local" and execution.get("local_response_reason") in {
+                    "empty_assistant",
+                    "context_length_exceeded",
+                    "invalid_output_token_parameter",
+                }:
+                    return response
+                kept_grace_calls = 0
+                if turn.tool_allowance is not None:
+                    response = response.model_copy(deep=True)
+                    choice = response.choices[0]
+                    kept = (choice.message.tool_calls or [])[: turn.tool_allowance]
+                    choice.message.tool_calls = kept or None
+                    choice.message.function_call = None
+                    kept_grace_calls = len(kept)
+                    if not kept and choice.finish_reason in ("tool_calls", "function_call"):
+                        choice.finish_reason = "stop"
+                    if turn.number == budget.config.hard_limit:
+                        choice.finish_reason = "stop"
+                turn.commit(grace_tool_calls=kept_grace_calls)
+                return response
+        except ModelTurnLimitReached as error:
+            execution = start_model_execution(request, upstream_attempted=False)
+            await capture_model_refusal(code=error.details.code, upstream_attempted=execution["upstream_attempted"])
+            execution.update(response_source="local", local_response_reason="model_turn_budget_exhausted")
+            raise HTTPException(422, detail=error.details.model_dump()) from error
+        except ModelTurnBudgetCapacityReached as error:
+            raise HTTPException(503, detail=str(error)) from error
+        finally:
+            if hasattr(request.state, "nemo_gym_model_turn_budget"):
+                del request.state.nemo_gym_model_turn_budget
+
+    async def _chat_completions(
+        self, request: Request, body: NeMoGymChatCompletionCreateParamsNonStreaming
     ) -> NeMoGymChatCompletion:
         if self.config.use_completions_api:
             return await self._chat_completions_via_completions_api(request, body)

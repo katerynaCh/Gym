@@ -1122,7 +1122,7 @@ class FileLineageStore(IncrementalLineageStore):
             self._append(rollout_id, {"model_call_id": model_call_id, "intent": True}, rows)
 
     async def refuse_call(self, rollout_id: str, model_call_id: str) -> None:
-        """Settle a worker-acknowledged refusal under the admission lock."""
+        """Settle a model-owned pre-dispatch or worker-acknowledged refusal under the admission lock."""
         await asyncio.to_thread(self._refuse_call, rollout_id, model_call_id)
 
     def _refuse_call(self, rollout_id: str, model_call_id: str) -> None:

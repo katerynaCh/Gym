@@ -152,6 +152,36 @@ gym eval run --no-serve \
     --output results/example_multi_step_rollouts.jsonl
 ```
 
+## Successful-request turn budgets
+
+`turn_budget` is off by default. Enable it on a single-worker Chat Completions model server when an evaluation requires a hard request limit:
+
+```yaml
+policy_model:
+  responses_api_models:
+    vllm_model:
+      entrypoint: app.py
+      num_workers: 1
+      turn_budget:
+        regular_turns: 55
+        grace_turns: 10
+        grace_tool_turns: 2
+        grace_tool_calls: 2
+        max_rollouts: 10000
+```
+
+The gateway keys each counter by the attempt-qualified `/ng-rollout/<capture-key>/...` route. Cookies, body metadata and client session headers do not select the counter. Requests without that route are refused before generation. Callers must preserve the assigned physical-attempt identity across requests.
+
+The example permits 55 successful regular requests with normal tool access. A final-answer notice starts on request 55. Successful requests 56 and 57 may each return one tool call, with at most two calls across the grace period. Requests 58 through 65 are text-only. The gateway constrains the outgoing request after caller and configuration overrides and removes excess modern or legacy function calls from the served completion. Request 65 ends with `finish_reason: stop`; a further request receives a typed HTTP 422 refusal without another upstream generation.
+
+Only a valid processed completion advances the counter. A failed, timed-out or cancelled request can retry the same turn. Stock local empty-assistant and synthesized context-refusal responses do not advance it; a valid zero-usage or reused completion does. Requests of an attempt are serialized, so concurrent requests cannot spend the same remaining turn twice. The ordinary Chat and converted Responses routes, including buffered Chat streaming, use this same counter. The native Responses backend and `/v1/completions` backend are unsupported while the budget is enabled.
+
+Counter records remain until the model server shuts down. `max_rollouts` bounds the number of admitted physical attempts; at capacity the server refuses new attempts with HTTP 503 while retaining existing counters. A server restart does not restore them. Partial-rollout checkpointing (`checkpoint.enabled: true`) is explicitly rejected when this budget is enabled. Complete-rollout recovery can start a new physical attempt; it must not claim that an old attempt continued with its counter restored.
+
+For the VTC-Bench N4 budget, compose `benchmarks/opencode_multimodal_benchmarks/vtcbench/opencode_hard_budget.yaml` instead of the ordinary `opencode.yaml`. This optional profile uses the stock OpenCode Agent Server, stock SingleAgentTurn Environment Server and stock model server. It sets `agent.build.steps: null`, which the adapter omits from the OpenCode configuration, so OpenCode's advisory step counter does not stop an evaluation before the successful-request budget. The ordinary visual-benchmark profiles retain their advisory behavior. Sampling, context, image and scoring settings are inherited unchanged.
+
+Stock OpenCode recognizes only the gateway's typed budget-refusal body as `agent_limit` and retains matching failure evidence. An ordinary provider HTTP 422 keeps its existing `model_request_error` classification. This configuration does not establish model rollout, deployment, health or benchmark-result qualification.
+
 ## The /v1/completions backend
 
 Set `use_completions_api: true` to drive vLLM's text-completions endpoint instead of chat completions. A ready-to-use config ships at `responses_api_models/vllm_model/configs/vllm_model_completions.yaml`:
