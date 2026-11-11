@@ -45,6 +45,16 @@ def test_only_the_replacement_prompt_is_protected_without_mutation(prompt):
     assert ('"username":' + ordinary) in serialized
 
 
+@pytest.mark.parametrize("config", [{}, {"agent": {}}, {"agent": {"build": {}}}])
+def test_replacement_without_a_prompt_keeps_ordinary_serialization(config):
+    config = config | {"username": "{env:G10_TEMPLATE_VALUE}"}
+    original = deepcopy(config)
+    serialized = _serialize_replacement_config(config)
+    assert json.loads(serialized) == original
+    assert serialized == json.dumps(original)
+    assert config == original
+
+
 @pytest.fixture
 def pinned_opencode():
     configured = os.environ.get("GYM_TEST_OPENCODE_BINARY")

@@ -16,6 +16,10 @@ from responses_api_agents.opencode_agent.tests.test_sandbox_sessions import capt
 from responses_api_agents.opencode_agent.tests.test_sandbox_sessions import seed as base_seed
 from responses_api_agents.opencode_agent.tests.test_sandbox_sessions import setup as opencode_setup  # noqa: F401
 from responses_api_agents.opencode_multimodal_agent.app import OpenCodeMultimodalAgent, OpenCodeMultimodalAgentConfig
+from responses_api_agents.opencode_multimodal_agent.eval import (
+    OpenCodeMultimodalEvalAgent,
+    OpenCodeMultimodalEvalConfig,
+)
 from responses_api_agents.opencode_multimodal_agent.rewards import OpenCodeToolRewardConfig
 from responses_api_agents.opencode_multimodal_agent.tests.test_app import body, image_url
 
@@ -89,6 +93,55 @@ def test_session_stages_original_image_replays_and_closes(visual_setup):
         assert not any("network_runner.py" in path for path in sandbox.files)
         closed = client.post("/v1/agent_sessions/close", json=close_body(created.json()["agent_session_id"]))
         assert closed.status_code == 200, closed.text
+    sandbox.stop.assert_awaited()
+
+
+@pytest.mark.parametrize("evaluation", [False, True])
+@pytest.mark.parametrize(
+    "mode,instructions",
+    [
+        ("replace", None),
+        ("append", None),
+        ("replace", "Use {literal}, {env:DO_NOT_SUBSTITUTE}, and {file:never-read.txt} literally."),
+    ],
+)
+def test_null_system_prompt_activates_owned_sessions(visual_setup, evaluation, mode, instructions):
+    original, sandbox = visual_setup
+    config_type = OpenCodeMultimodalEvalConfig if evaluation else OpenCodeMultimodalAgentConfig
+    agent_type = OpenCodeMultimodalEvalAgent if evaluation else OpenCodeMultimodalAgent
+    settings = original.config.model_dump() | {"system_prompt": None, "system_prompt_mode": mode}
+    if evaluation:
+        settings["final_answer_reserve"] = None
+    config = config_type.model_validate(settings)
+    assert config.system_prompt is None and config.system_prompt_mode == mode
+    agent = agent_type(config=config, server_client=original.server_client)
+    exported = json.loads(sandbox.events)
+    for message in exported["messages"]:
+        message["parts"] = [part for part in message["parts"] if part.get("type") != "file"]
+    sandbox.events = json.dumps(exported)
+    body = {"input": "task"}
+    if instructions is not None:
+        body["instructions"] = instructions
+    with TestClient(agent.setup_webserver()) as client:
+        created = client.post("/v1/agent_sessions", json=seed().model_dump(mode="json"))
+        assert created.status_code == 200, created.text
+        sandbox.start.assert_awaited_once()
+        try:
+            response = client.post("/ng-rollout/opencode-smoke-a2/v1/responses", json=body)
+            assert response.status_code == 200, response.text
+            assert response.json().get("status") != "failed", response.text
+            sandbox.launch.assert_awaited_once()
+            serialized = sandbox.params()["env"]["OPENCODE_CONFIG_CONTENT"]
+            policy = json.loads(serialized)
+            if instructions is None:
+                assert "prompt" not in policy.get("agent", {}).get("build", {})
+            else:
+                assert policy["agent"]["build"]["prompt"] == instructions
+                assert "{env:DO_NOT_SUBSTITUTE}" not in serialized
+                assert "{file:never-read.txt}" not in serialized
+        finally:
+            closed = client.post("/v1/agent_sessions/close", json=close_body(created.json()["agent_session_id"]))
+            assert closed.status_code == 200, closed.text
     sandbox.stop.assert_awaited()
 
 
