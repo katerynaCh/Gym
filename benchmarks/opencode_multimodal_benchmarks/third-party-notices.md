@@ -1,17 +1,8 @@
 # OpenCode prompt attribution
 
-`prompts/combined.txt` adapts the OpenCode 1.17.11 `anthropic.txt` prompt with
-additional visual-task instructions. The system prompt in
-`benchmarks/opencode_multimodal_benchmarks/opencode_eval_agent.yaml` reproduces that
-version's `default.txt` prompt.
-
-The final-turn directive in `responses_api_models/vllm_model/app_opencode.py`
-also comes from this revision. `prompts/combined.txt.license` records the prompt
-attribution without adding license text to model input.
+The system prompt in `opencode_eval_agent.yaml` reproduces OpenCode 1.17.11's `default.txt` prompt.
 
 Sources:
-- https://github.com/anomalyco/opencode/blob/67aec2212010d67775c35e696d8b8b54902eb338/packages/core/src/session/runner/max-steps.ts
-- https://github.com/anomalyco/opencode/blob/67aec2212010d67775c35e696d8b8b54902eb338/packages/opencode/src/session/prompt/anthropic.txt
 - https://github.com/anomalyco/opencode/blob/67aec2212010d67775c35e696d8b8b54902eb338/packages/opencode/src/session/prompt/default.txt
 - https://github.com/anomalyco/opencode/blob/67aec2212010d67775c35e696d8b8b54902eb338/LICENSE
 
