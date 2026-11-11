@@ -800,14 +800,11 @@ class TestYieldInputsAndRolloutsPaired:
 
 
 class TestBuildVerifyPayload:
-    @pytest.mark.parametrize("shaped", [False, True])
-    def test_native_evidence_without_original_contract_cannot_authorize_replay(self, shaped):
+    @pytest.mark.parametrize("transform", [False, {"kind": "invalid"}])
+    def test_transformation_without_original_contract_cannot_authorize_replay(self, transform):
         pair = InputRolloutPair(
             input={"verifier_metadata": {"answer": "A"}},
-            rollout={
-                "response": {"output": [], "opencode_evidence": {"tool_reward": {} if shaped else None}},
-                "reward": 1.1 if shaped else 1.0,
-            },
+            rollout={"response": {"output": []}, "reward": 1.0, "ng_grading_transform": transform},
         )
         with pytest.raises(ConfigError, match="digest-verified original plain"):
             _check_saved_answer_replay(pair)
@@ -3566,9 +3563,12 @@ class TestResumeOfOutputCachedWithoutIdentityStamps:
     async def test_stamped_source_plan_keeps_all_repeats_with_resource_only_reverification(
         self, tmp_path, monkeypatch, resume, missing
     ):
-        from nemo_gym.client.server_client import ServerClient
-        from resources_servers.opencode_multimodal_benchmarks.app import VisualBenchmarksConfig, VisualBenchmarksServer
+        async def aggregate(request):
+            return {"agent_metrics": {}, "key_metrics": {}, "group_level_metrics": []}
 
+        await self._stamped_source_plan(tmp_path, monkeypatch, resume, missing, aggregate)
+
+    async def _stamped_source_plan(self, tmp_path, monkeypatch, resume, missing, aggregate):
         inputs = [
             {
                 TASK_INDEX_KEY_NAME: task,
@@ -3589,22 +3589,18 @@ class TestResumeOfOutputCachedWithoutIdentityStamps:
         if resume:
             self._write(tmp_path / "output.jsonl", [inputs[0] | {"reward": 1.0}])
         self._patch(monkeypatch, [], [])
-        visual = VisualBenchmarksServer(
-            config=VisualBenchmarksConfig(host="127.0.0.1", port=12345, name="rs_a", entrypoint="app.py"),
-            server_client=MagicMock(spec=ServerClient),
-        )
         client = MagicMock(global_config_dict={"rs_a": {"resources_servers": {"visual": {}}}})
         requests, metrics = [], []
 
         async def post(server_name, url_path, json):
             assert server_name == "rs_a" and url_path == "/aggregate_metrics"
             requests.append(json)
-            value = await visual.aggregate_metrics(json)
+            value = await aggregate(json)
             metrics.append(value)
             return value
 
         async def response_json(value):
-            return value.model_dump(mode="json")
+            return value
 
         def run(payloads, semaphore=None):
             async def grade(row):
@@ -3627,9 +3623,8 @@ class TestResumeOfOutputCachedWithoutIdentityStamps:
         await RolloutReverificationHelper().run_from_config(self._config(tmp_path, resume=resume))
         assert len(requests) == 1
         assert requests[0].expected_rollout_indices == {0: [0, 1], 1: [0, 1]}
-        assert metrics[0].agent_metrics["VStarBench/complete"] is (not missing)
-        assert ("accuracy" in metrics[0].agent_metrics) is (not missing)
         assert len(requests[0].verify_responses) == (3 if missing else 4)
+        return metrics[0]
 
 
 class TestRunFromConfigJudgeFailedOnly:

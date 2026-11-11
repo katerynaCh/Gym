@@ -371,36 +371,21 @@ def _saved_environments(pair: InputRolloutPair, servers: Mapping[str, Any]) -> l
     return [(implementation, settings) for _, implementation, settings in _saved_environment_entries(pair, servers)]
 
 
-def _opencode_environment(environment: tuple[str, Mapping]) -> bool:
-    implementation, settings = environment
-    return implementation == "single_agent_turn" and settings.get("entrypoint") == "opencode.py"
-
-
 def _check_saved_answer_replay(pair: InputRolloutPair, source: _ReplaySource | None = None) -> None:
-    """Authorize native full-response replay from the original plain environment, never current policy."""
+    """Replay transformed grades only from their verified original plain environment."""
+    if "ng_grading_transform" not in pair.rollout:
+        return
     original = pair
     if source is not None and source.store is not None:
         identity = pair.rollout if TASK_INDEX_KEY_NAME in pair.rollout else pair.input
         original = InputRolloutPair(input=source.store.inputs_for([identity])[0], rollout=pair.rollout)
     environments = _saved_environments(original, source.servers) if source is not None and source.servers else []
-    special = any(_opencode_environment(environment) for environment in environments)
     ordinary = len(environments) == 1 and environments[0][0] in {"single_agent_turn", "single_agent_turn_legacy"}
     ordinary = ordinary and environments[0][1].get("entrypoint", "app.py") == "app.py"
-    response = pair.rollout.get("response", pair.rollout.get("_ng_failure_partial_response"))
-    native = isinstance(response, Mapping) and "opencode_evidence" in response
-    stamp = original.rollout.get(
-        ENVIRONMENT_SERVER_STAMP_KEY_NAME, original.input.get(ENVIRONMENT_SERVER_STAMP_KEY_NAME)
-    )
-    if not environments and source is not None and isinstance(stamp, str) and not native:
-        special = any(
-            _opencode_environment(environment)
-            for environment in _saved_environments(original, setup_server_client().global_config_dict)
-        )
-    if special or ((native or "opencode_tool_reward" in pair.rollout) and not ordinary):
+    if not ordinary:
         raise ConfigError(
-            "reverify: OpenCode environment grading cannot be replayed through a direct resources-server /verify. "
-            "Native full-response replay requires a digest-verified original plain SingleAgentTurn environment "
-            "using app.py; current configuration and cached results cannot establish that source contract. "
+            "reverify: a saved grading transformation requires a digest-verified original plain SingleAgentTurn "
+            "environment using app.py; current configuration and cached results cannot establish that source contract. "
             "Keep the saved reward and grading evidence."
         )
 

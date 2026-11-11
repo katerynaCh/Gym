@@ -16,8 +16,14 @@ from nemo_gym.config.config_types import ConfigError
 from nemo_gym.rollouts.rollout_records import RUN_ID_KEY, RolloutRecord, materialized_path_for, read_records
 from nemo_gym.rollouts.rollout_recovery import RunManifest, config_identity_path_for, manifest_path_for, run_lock
 from nemo_gym.rollouts.rollout_store import RolloutStore
+from nemo_gym.trajectory.trajectory_record import (
+    AgentObservationBundle,
+    TrajectoryRecord,
+    grading_result_binding,
+    grading_transform_source,
+)
 from nemo_gym.utils.path_utils import aggregation_sources_path_for
-from tests.helpers.single_agent_turn import _agent_response, _environment_server, _request, _Response
+from tests.helpers.single_agent_turn import _agent_response, _Response
 from tests.unit_tests.rollouts.test_rollout_store import prepared_run, snapshot  # noqa: F401
 
 
@@ -33,22 +39,40 @@ def _config(output: Path, destination: Path, **kwargs) -> reverify.RolloutReveri
 
 
 def _replay_servers() -> dict:
+    bindings = {
+        "agent_server": {"name": "agent", "type": "responses_api_agents"},
+        "resources_server": {"name": "resources", "type": "resources_servers"},
+    }
     return {
         "agent": {"responses_api_agents": {"fixture": {"resources_server": {"name": "resources"}}}},
         "resources": {"resources_servers": {"fixture": {}}},
-        **{
-            name: {
-                "environment_servers": {
-                    "single_agent_turn": {
-                        "entrypoint": entrypoint,
-                        "agent_server": {"name": "agent", "type": "responses_api_agents"},
-                        "resources_server": {"name": "resources", "type": "resources_servers"},
-                    }
-                }
-            }
-            for name, entrypoint in (("plain", "app.py"), ("special", "opencode.py"))
-        },
+        "plain": {"environment_servers": {"single_agent_turn": bindings | {"entrypoint": "app.py"}}},
+        "legacy_plain": {"environment_servers": {"single_agent_turn_legacy": bindings}},
+        "nonplain": {"environment_servers": {"custom_environment": bindings}},
+        "ambiguous": {"environment_servers": {"single_agent_turn": bindings, "custom_environment": bindings}},
     }
+
+
+def _transformed_result(response=None) -> dict:
+    response = response if response is not None else _agent_response().model_dump(mode="json")
+    original = {"response": response, "reward": 1.0}
+    transform = {
+        "kind": "response_projection_reward_offset_v1",
+        "input_result": original,
+        "input_binding_sha256": grading_result_binding(original),
+        "reward_offset": 0.1,
+        "reward_component": "fixture_bonus",
+        "parameters": {"operation": "fixture_projection"},
+    }
+    result = {
+        "response": response,
+        "reward": 1.1,
+        "reward_components": {"verifier": 1.0, "fixture_bonus": 0.1},
+        "ng_grading_transform": transform,
+    }
+    transform["output_binding_sha256"] = grading_result_binding(result)
+    assert grading_transform_source(result) is not None
+    return result
 
 
 def _saved_run(tmp_path: Path, outcomes: list[tuple[str, dict]]) -> tuple[Path, list[dict]]:
@@ -91,53 +115,58 @@ def _replay_client(monkeypatch, *, servers: dict | None = None):
     return client
 
 
-async def test_plain_native_response_replays_from_its_original_environment(tmp_path, monkeypatch):
-    environment, producer = _environment_server()
-    response = _agent_response().model_dump(mode="json")
-    response["opencode_evidence"] = {"turns_used": 1, "finished_naturally": True, "tool_reward": None}
-    producer.responses = [_Response({"responses_create_params": {"input": []}, "response": response, "reward": 1})]
-    from environment_servers.single_agent_turn.app import SessionHandles
-
-    result = await environment._verify(
-        _request(),
-        SessionHandles(resources_session_id="resource", agent_session_id="agent"),
-        type(_agent_response()).model_validate(response),
-        None,
-    )
-    assert len(producer.calls) == 1 and producer.calls[0][1] == "/verify"
-    assert producer.calls[0][2]["json"]["response"] == response
-    output, _ = _saved_run(tmp_path, [("plain", result.model_dump(mode="json"))])
+@pytest.mark.parametrize("route", ["plain", "legacy_plain"])
+@pytest.mark.parametrize("prior_transform", ["valid", False, {"kind": "invalid"}])
+async def test_transformed_saved_response_replays_from_its_original_environment(
+    tmp_path, monkeypatch, route, prior_transform
+):
+    result = _transformed_result()
+    if prior_transform != "valid":
+        result["ng_grading_transform"] = prior_transform
+    trajectory = TrajectoryRecord(schema_version="2.0", task_id="task", rollout_id="0-0").model_dump(mode="json")
+    observations = AgentObservationBundle(schema_version="2.0", source="opencode", records=[]).model_dump(mode="json")
+    result.update(ng_trajectory=trajectory, ng_agent_observations=observations)
+    output, _ = _saved_run(tmp_path, [(route, result)])
     current = _replay_servers()
-    current["plain"]["environment_servers"]["single_agent_turn"]["entrypoint"] = "opencode.py"
+    current[route] = current["nonplain"]
     client = _replay_client(monkeypatch, servers=current)
     before = snapshot(output)
+
     results = await reverify.RolloutReverificationHelper().run_from_config(
         _config(output, tmp_path / "rescored.jsonl")
     )
+
     assert [row["reward"] for row in results] == [0.25]
     client.post.assert_awaited_once()
-    assert client.post.await_args.kwargs["json"]["response"] == response
+    payload = client.post.await_args.kwargs["json"]
+    assert payload["response"] == result["response"]
+    assert payload["ng_trajectory"] == trajectory
+    assert payload["ng_agent_observations"] == observations
+    assert not {"reward", "reward_components", "ng_grading_transform"} & payload.keys()
     assert list(read_records(tmp_path / "rescored.jsonl")) == results
     assert {name: data for name, data in snapshot(output).items() if name in before} == before
 
 
-@pytest.mark.parametrize("kind", ["native", "failed", "verification_error"])
+@pytest.mark.parametrize("route", ["nonplain", "ambiguous"])
+@pytest.mark.parametrize("kind", ["transformed", "failed", "verification_error"])
 @pytest.mark.parametrize("resume", [False, True])
-async def test_original_special_environment_refuses_before_output_changes(tmp_path, monkeypatch, kind, resume):
+async def test_transformed_source_refuses_before_output_changes(tmp_path, monkeypatch, route, kind, resume):
     response = _agent_response().model_dump(mode="json")
-    response["opencode_evidence"] = {"turns_used": 1, "finished_naturally": True, "tool_reward": None}
-    result = {"response": response, "reward": 1.0}
+    result = _transformed_result(response)
     if kind == "failed":
         result = {
             "response": response | {"status": "failed", "error": {"code": "server_error", "message": "limit"}},
             "reward": 0.0,
             "scorer": "agent-failure",
         }
-        result["response"].pop("opencode_evidence")
+        result["ng_grading_transform"] = _transformed_result()["ng_grading_transform"]
     elif kind == "verification_error":
-        response["opencode_evidence"]["verification_error"] = "unusable native evidence"
-        result = {"_ng_failure_class": "judge_failed", "_ng_failure_partial_response": response}
-    output, [saved] = _saved_run(tmp_path, [("special", result)])
+        result = {
+            "_ng_failure_class": "judge_failed",
+            "_ng_failure_partial_response": response,
+            "ng_grading_transform": _transformed_result()["ng_grading_transform"],
+        }
+    output, [saved] = _saved_run(tmp_path, [(route, result)])
     destination = tmp_path / "rescored.jsonl"
     config = _config(
         output, destination, overwrite=True, resume_from_cache=resume, judge_failed_only=kind == "verification_error"
@@ -152,18 +181,17 @@ async def test_original_special_environment_refuses_before_output_changes(tmp_pa
         destination.write_bytes(orjson.dumps({"_ng_task_index": 0, "_ng_rollout_index": 0, "reward": 1.0}) + b"\n")
     aggregation_sources_path_for(destination).write_text("keep the previous shard list\n")
     current = _replay_servers()
-    current["special"]["environment_servers"]["single_agent_turn"]["entrypoint"] = "app.py"
+    current[route] = current["plain"]
     client = _replay_client(monkeypatch, servers=current)
     before = snapshot(output)
-    with pytest.raises(ConfigError, match="OpenCode environment grading"):
+    with pytest.raises(ConfigError, match="digest-verified original plain"):
         await reverify.RolloutReverificationHelper().run_from_config(config)
     client.post.assert_not_awaited()
     assert snapshot(output) == before
 
 
-async def test_unverified_identity_cannot_authorize_native_replay(tmp_path, monkeypatch):
-    response = _agent_response().model_dump(mode="json") | {"opencode_evidence": {"tool_reward": None}}
-    output, _ = _saved_run(tmp_path, [("plain", {"response": response, "reward": 1.0})])
+async def test_unverified_identity_cannot_authorize_transformed_replay(tmp_path, monkeypatch):
+    output, _ = _saved_run(tmp_path, [("plain", _transformed_result())])
     identity = config_identity_path_for(manifest_path_for(output))
     identity.write_bytes(identity.read_bytes().replace(b'"app.py"', b'"other.py"'))
     client = _replay_client(monkeypatch)
@@ -174,16 +202,22 @@ async def test_unverified_identity_cannot_authorize_native_replay(tmp_path, monk
     assert snapshot(output) == before
 
 
-async def test_special_source_preflight_precedes_withdrawal_and_seeding(tmp_path, monkeypatch):
+async def test_transformed_source_preflight_precedes_withdrawal_and_seeding(tmp_path, monkeypatch):
     response = _agent_response().model_dump(mode="json")
     output, [failure] = _saved_run(
-        tmp_path, [("special", {"response": response, "_ng_failure_class": "judge_failed", "_ng_failure_id": "judge"})]
+        tmp_path,
+        [
+            (
+                "nonplain",
+                _transformed_result(response) | {"_ng_failure_class": "judge_failed", "_ng_failure_id": "judge"},
+            )
+        ],
     )
     with run_lock(output), RolloutStore.open_for_rejudgment(output) as store:
         pending = store.admit_rejudgment(failure)
     client = _replay_client(monkeypatch)
     before = snapshot(output)
-    with pytest.raises(ConfigError, match="OpenCode environment grading"):
+    with pytest.raises(ConfigError, match="digest-verified original plain"):
         await reverify.RolloutReverificationHelper().run_from_config(
             _config(
                 output,
@@ -198,37 +232,44 @@ async def test_special_source_preflight_precedes_withdrawal_and_seeding(tmp_path
     assert RolloutStore.read(output).manifest.pending_rejudge["0-0"].operation_id == pending.operation_id
 
 
-async def test_atif_uses_original_materialized_source_before_projection(tmp_path, monkeypatch):
-    output, _ = _saved_run(
-        tmp_path, [("special", {"response": _agent_response().model_dump(mode="json"), "reward": 0})]
-    )
+async def test_untransformed_atif_projects_a_real_trajectory_and_verifies_it(tmp_path, monkeypatch):
+    output, _ = _saved_run(tmp_path, [("plain", {"response": _agent_response().model_dump(mode="json"), "reward": 0})])
+    fixture = Path(__file__).parent.parent / "trajectory" / "fixtures" / "relay_atif_v1_7_tool_trajectory.json"
     manifest = tmp_path / "external.jsonl"
     manifest.write_bytes(
-        orjson.dumps({"trajectory_path": "not-read.json", "_ng_task_index": 0, "_ng_rollout_index": 0}) + b"\n"
+        orjson.dumps({"trajectory_path": str(fixture), "_ng_task_index": 0, "_ng_rollout_index": 0}) + b"\n"
     )
-    current = _replay_servers()
-    current["special"]["environment_servers"]["single_agent_turn"]["entrypoint"] = "app.py"
-    client = _replay_client(monkeypatch, servers=current)
+    client = _replay_client(monkeypatch)
     before = snapshot(output)
-    with pytest.raises(ConfigError, match="OpenCode environment grading"):
-        await reverify.RolloutReverificationHelper().run_from_config(
-            reverify.RolloutReverificationConfig(
-                input_format="atif",
-                materialized_inputs_jsonl_fpath=str(materialized_path_for(output)),
-                atif_manifest_jsonl_fpath=str(manifest),
-                output_jsonl_fpath=str(tmp_path / "rescored.jsonl"),
-                disable_aggregation=True,
-                upload_rollouts=False,
-            )
+
+    result = await reverify.RolloutReverificationHelper().run_from_config(
+        reverify.RolloutReverificationConfig(
+            input_format="atif",
+            materialized_inputs_jsonl_fpath=str(materialized_path_for(output)),
+            atif_manifest_jsonl_fpath=str(manifest),
+            output_jsonl_fpath=str(tmp_path / "rescored.jsonl"),
+            disable_aggregation=True,
+            upload_rollouts=False,
         )
-    client.post.assert_not_awaited()
-    assert snapshot(output) == before
+    )
+
+    client.post.assert_awaited_once()
+    payload = client.post.await_args.kwargs["json"]
+    assert [item["type"] for item in payload["response"]["output"]] == [
+        "function_call",
+        "function_call_output",
+        "message",
+    ]
+    assert "ng_grading_transform" not in payload
+    assert [row["reward"] for row in result] == [0.25]
+    assert list(read_records(tmp_path / "rescored.jsonl")) == result
+    assert {name: data for name, data in snapshot(output).items() if name in before} == before
 
 
-async def test_unselected_special_history_does_not_block_plain_saved_answer(tmp_path, monkeypatch):
+async def test_unselected_nonplain_history_does_not_block_plain_saved_answer(tmp_path, monkeypatch):
     response = _agent_response().model_dump(mode="json")
     output, saved = _saved_run(
-        tmp_path, [("special", {"response": response, "reward": 0}), ("plain", {"response": response, "reward": 1})]
+        tmp_path, [("nonplain", _transformed_result(response)), ("plain", {"response": response, "reward": 1})]
     )
     with RolloutStore.open_for_rejudgment(output) as store:
         newer = dict(saved[0])
@@ -242,13 +283,13 @@ async def test_unselected_special_history_does_not_block_plain_saved_answer(tmp_
     assert {name: data for name, data in snapshot(output).items() if name in before} == before
 
 
-async def test_recovery_carries_special_agent_failure_zero_without_regrading_it(tmp_path, monkeypatch):
+async def test_recovery_carries_nonplain_agent_failure_zero_without_regrading_it(tmp_path, monkeypatch):
     response = _agent_response().model_dump(mode="json")
     output, _ = _saved_run(
         tmp_path,
         [
             (
-                "special",
+                "nonplain",
                 {
                     "response": response | {"status": "failed", "error": {"code": "server_error", "message": "limit"}},
                     "reward": 0,
@@ -270,15 +311,17 @@ async def test_recovery_carries_special_agent_failure_zero_without_regrading_it(
     assert {name: data for name, data in snapshot(output).items() if name in before} == before
 
 
-async def test_special_saved_result_is_checked_before_settlement(tmp_path, monkeypatch):
+async def test_nonplain_saved_result_is_checked_before_settlement(tmp_path, monkeypatch):
     from tests.unit_tests.eval.test_reverify_saved_results import verify_transport_masked
 
-    output, _ = _saved_run(tmp_path, [("special", verify_transport_masked())])
+    result = verify_transport_masked()
+    result["ng_grading_transform"] = _transformed_result()["ng_grading_transform"]
+    output, _ = _saved_run(tmp_path, [("nonplain", result)])
     with run_lock(output):
         pass
     client = _replay_client(monkeypatch)
     before = snapshot(output)
-    with pytest.raises(ConfigError, match="OpenCode environment grading"):
+    with pytest.raises(ConfigError, match="digest-verified original plain"):
         await reverify.RolloutReverificationHelper().run_from_config(
             _config(output, tmp_path / "rescored.jsonl", judge_failed_only=True, settle_into_source=True)
         )
@@ -651,7 +694,8 @@ def test_repeat_plan_uses_verified_source_route_for_a_task_without_any_outcome(t
     source.write_bytes(b"".join(orjson.dumps(row) + b"\n" for row in rows))
     output = tmp_path / "rollouts.jsonl"
     servers = _replay_servers()
-    del servers["special"]
+    for route in ("nonplain", "legacy_plain", "ambiguous"):
+        del servers[route]
     with RolloutStore.start_or_resume(
         output, lambda: (rows, RunManifest.create(source, rows, {}, servers)), resume=False
     ) as store:
@@ -669,25 +713,3 @@ def test_repeat_plan_uses_verified_source_route_for_a_task_without_any_outcome(t
     )
     assert plan.inventory == {("plain", "resources"): {0: [0], 1: [0]}}
     assert plan.unknown == set()
-
-
-async def test_verifier_owned_tool_reward_replays_with_original_execution_evidence(tmp_path, monkeypatch):
-    evidence = {"schema_version": "2.0", "source": "opencode", "records": []}
-    output, _ = _saved_run(
-        tmp_path,
-        [
-            (
-                "plain",
-                {
-                    "response": _agent_response().model_dump(mode="json"),
-                    "reward": 1.1,
-                    "opencode_tool_reward": {"auxiliary_reward": 0.1},
-                    "ng_agent_observations": evidence,
-                },
-            )
-        ],
-    )
-    client = _replay_client(monkeypatch)
-    await reverify.RolloutReverificationHelper().run_from_config(_config(output, tmp_path / "rescored.jsonl"))
-    assert client.post.await_args.kwargs["json"]["ng_agent_observations"] == evidence
-    assert "opencode_tool_reward" not in client.post.await_args.kwargs["json"]
