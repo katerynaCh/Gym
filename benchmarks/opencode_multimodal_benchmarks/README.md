@@ -25,15 +25,15 @@ sandbox through Gym's shared agent-session lifecycle.
 This uses the same provider execution boundary as BrowseComp's OpenCode pairing.
 The deployment chooses the provider, task image and network separation. It does
 not replace the benchmark's tools with BrowseComp's Exa wrappers. Prompts,
-sampling, 55+10 turn budgets and scorers are preserved; ZeroBench still uses five
+sampling and scorers are preserved, and the turn budget is a 65-step limit; ZeroBench still uses five
 repeats and primary pass@5.
 
 All evaluations use owned OpenSandbox sessions. Supply provider credentials through
 runtime environment variables and an image with the visual tools and offline
 OpenCode assets required by the chosen network policy. Evaluation and training
 share the same session implementation; the local relay recipes have been removed.
-See the [agent session setup](../../responses_api_agents/opencode_multimodal_agent/README.md#agent-sessions)
-and [network profiles](../../responses_api_agents/opencode_multimodal_agent/README.md#network-and-tool-profiles).
+Gym's own [`opencode_agent`](../../responses_api_agents/opencode_agent/README.md) runs the episodes; see its README for agent sessions,
+`network_access` and offline runtimes.
 Resume historical runs with their recorded Gym revision and configuration.
 
 ## Run configuration
@@ -97,8 +97,9 @@ Catalog pairings have no whole-episode deadline by default. To set one, configur
 event loop's monotonic clock. Cleanup has a separate
 `cleanup_timeout_seconds` budget and runs after the episode deadline.
 
-The OpenCode overlay has a 131072-token context/output ceiling and a 55+10 turn
-budget. Its `timeout` setting (optionally narrowed by request metadata
+The OpenCode overlay has a 131072-token context/output ceiling and a 65-step limit
+(`opencode_config.agent.build.steps`): from that step on OpenCode asks for a text answer but still offers
+the tools, so the timeout and the context window are the hard stops. Its `timeout` setting (optionally narrowed by request metadata
 `agent_timeout_sec`) is a separate harness execution deadline, enforced
 by the shared OpenCode sandbox session using the monotonic clock; installation
 uses `sandbox_install_timeout_seconds`, and close uses
