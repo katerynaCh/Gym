@@ -1064,8 +1064,12 @@ class TestStripImageBlocks:
 
         content = stripped.responses_create_params.input[0].content
         assert [_block_type(block) for block in content] == ["input_text"]
-        gaps = stripped.model_extra["ng_trajectory"]["gaps"]
-        assert {"code": "multimodal_history_redacted"} in gaps
+        assert stripped.ng_trajectory is not None
+        assert [gap.code for gap in stripped.ng_trajectory.gaps] == ["multimodal_history_redacted"]
+        wire = stripped.model_dump(mode="json")
+        assert wire["ng_trajectory"]["task_id"] == "t"
+        assert wire["ng_trajectory"]["rollout_id"] == "r"
+        assert [gap["code"] for gap in wire["ng_trajectory"]["gaps"]] == ["multimodal_history_redacted"]
 
 
 class TestVerifyTransportRetry:

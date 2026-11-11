@@ -1069,7 +1069,8 @@ class TestApp:
         assert "_ng_trajectory" not in verify_payload["response"]
         assert "ng_trajectory" not in verify_payload
         assert result.ng_trajectory is not None
-        assert result.ng_trajectory["rollout_id"] == "explicit-rollout-a2"
+        assert result.ng_trajectory.rollout_id == "explicit-rollout-a2"
+        assert result.model_dump(mode="json")["ng_trajectory"]["rollout_id"] == "explicit-rollout-a2"
         assert body.model_dump() == body_before
 
     async def test_run_preserves_response_aliases_in_verify_payload(self) -> None:

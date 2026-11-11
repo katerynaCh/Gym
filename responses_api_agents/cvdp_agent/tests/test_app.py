@@ -754,7 +754,9 @@ class TestSimpleRunAttemptEvidence:
         )
 
         assert len(model_requests) == 1 and len(verify_payloads) == 1
-        assert result["response"]["usage"] == verify_payloads[0]["response"]["usage"]
+        assert _drop_nulls(result["response"]) == _drop_nulls(verify_payloads[0]["response"])
+        assert "ng_trajectory" not in verify_payloads[0]
+        assert result["ng_trajectory"]["schema_version"] == "1.0"
         assert [ref["response_id"] for ref in result["ng_trajectory"]["invocations"][0]["model_calls"]] == ["resp_a"]
 
     def test_attempt_without_a_reply_is_a_missing_reference_not_an_invented_one(self) -> None:

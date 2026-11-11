@@ -615,11 +615,7 @@ class CVDPAgent(SimpleResponsesAPIAgent):
             return result
         try:
             return result.model_copy(
-                update={
-                    "ng_trajectory": self._trajectory(body, rollout_id, invocation, turns, gaps).model_dump(
-                        mode="json"
-                    )
-                }
+                update={"ng_trajectory": self._trajectory(body, rollout_id, invocation, turns, gaps)}
             )
         except Exception:
             # Without a valid trajectory the record keeps no ownership evidence, as before this agent reported any.
