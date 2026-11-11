@@ -6,6 +6,7 @@ import json
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from fastapi.testclient import TestClient
 
 from nemo_gym.core import rollout_context
 from nemo_gym.server_runtime import observe_verifier
@@ -130,3 +131,66 @@ async def test_malformed_reply_before_valid_verdict_is_not_falsely_certified(ser
     (operation,) = result["ng_verifier_invocations"][0]["grading_operations"]
     assert operation["outcome"] == "unknown"
     assert {ref["response_id"] for ref in operation["dependencies"]} == {"invalid", "valid"}
+
+
+@pytest.mark.parametrize("benchmark", ["VStarBench", "VTCBench"])
+@pytest.mark.parametrize("failed", [False, True])
+def test_http_option_text_distinguishes_api_failure_from_a_valid_answer(server, benchmark, failed):
+    server.server_client.global_config_dict = {"observability_enabled": True}
+    server.config.judge_server = "judge"
+    server.server_client.post = AsyncMock(return_value=judge_reply("Z"))
+    prediction = "Failed to obtain answer via API. a small cat" if failed else "The API returned a small cat"
+    body = request(benchmark, prediction, options={"A": "a small cat", "B": "a very large dog"})
+    with TestClient(server.setup_webserver()) as client:
+        response = client.post("/ng-rollout/api-option/verify", json=body.model_dump(mode="json"))
+    assert response.status_code == 200
+    result = response.json()
+    assert result["reward"] == (0 if failed else 1)
+    assert result["mask_sample"] is False and result["evaluation_completed"] is True
+    assert result["response"] == body.response.model_dump(mode="json")
+    (grade,) = result["ng_verifier_invocations"][0]["grading_operations"]
+    assert grade["outcome"] == "completed"
+    if failed:
+        assert result["extraction_method"] == "llm" and grade["kind"] == "llm_judge"
+        server.server_client.post.assert_awaited_once()
+    else:
+        assert grade["kind"] == "programmatic_calculation"
+        server.server_client.post.assert_not_awaited()
+
+
+def test_http_api_failure_judge_replies_remain_masked_judge_failures(server):
+    server.server_client.global_config_dict = {"observability_enabled": True}
+    server.config.judge_server = "judge"
+    failed = "Failed to obtain answer via API. a small cat"
+    server.server_client.post = AsyncMock(side_effect=[judge_reply(failed, "first"), judge_reply(failed, "second")])
+    body = request("VStarBench", "uncertain animal", options={"A": "a small cat", "B": "a very large dog"})
+    with TestClient(server.setup_webserver()) as client:
+        response = client.post("/ng-rollout/api-judge/verify", json=body.model_dump(mode="json"))
+    assert response.status_code == 200
+    result = response.json()
+    assert result["reward"] == 0 and result["mask_sample"] is True
+    assert result["failure_kind"] == result["_ng_failure_class"] == "judge_failed"
+    assert result["response"] == body.response.model_dump(mode="json")
+    assert server.server_client.post.await_count == 2
+    prompts = [call.kwargs["json"]["messages"][0]["content"] for call in server.server_client.post.await_args_list]
+    assert prompts[1].startswith(prompts[0]) and prompts[1] != prompts[0]
+    (grade,) = result["ng_verifier_invocations"][0]["grading_operations"]
+    assert grade["kind"] == "llm_judge" and grade["outcome"] == "failed"
+
+
+def test_http_rule_only_vtc_does_not_credit_api_failure_text(server):
+    server.server_client.global_config_dict = {"observability_enabled": True}
+    server.config.vtc_llm_fallback = False
+    server.server_client.post = AsyncMock(side_effect=AssertionError("Rule-only verification must not judge"))
+    body = request(
+        "VTCBench",
+        "Failed to obtain answer via API. a small cat",
+        options={"A": "a small cat", "B": "a very large dog"},
+    )
+    with TestClient(server.setup_webserver()) as client:
+        response = client.post("/ng-rollout/api-rule/verify", json=body.model_dump(mode="json"))
+    assert response.status_code == 200
+    result = response.json()
+    assert result["reward"] == 0 and result["mask_sample"] is False
+    assert result["extraction_method"] == "rule" and result["scorer"] == "vtcbench-final-answer-rules-v4"
+    server.server_client.post.assert_not_awaited()

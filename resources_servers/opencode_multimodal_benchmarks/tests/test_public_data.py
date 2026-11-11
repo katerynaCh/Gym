@@ -27,6 +27,12 @@ def test_verbose_option_must_be_available_and_api_failure_not_salvaged():
     assert infer_option("Failed to obtain answer via API. The answer is B.", {"A": "cat", "B": "dog"}) is None
 
 
+def test_api_failure_cannot_match_long_option_text():
+    choices = {"A": "a small cat", "B": "a very large dog"}
+    assert infer_option("Failed to obtain answer via API. a small cat", choices) is None
+    assert infer_option("The API returned a small cat", choices) == "A"
+
+
 @pytest.mark.parametrize(
     "prediction,expected",
     [

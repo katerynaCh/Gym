@@ -46,7 +46,7 @@ def infer_option(prediction: str, choices: dict[str, str]) -> str | None:
             return letters[0]
         if not letters and "Z" in tokens:
             return "Z"
-    if len(answer) <= 2 * sum(len(str(value)) for value in choices.values()):
+    if not failed and len(answer) <= 2 * sum(len(str(value)) for value in choices.values()):
         matches = [letter for letter, value in choices.items() if str(value).lower() in answer.lower()]
         if len(matches) == 1:
             return matches[0]
