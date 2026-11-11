@@ -70,19 +70,20 @@ harness conformance.
 The Resources Server owns grading. Deterministic scores, including incorrect or
 empty-answer zeros, use `observe_programmatic_grading`. Gym-routed judges use
 `observe_llm_judge_grading`, `call_judge`, and a parsed-verdict marker. The recorded
-operation binds the response actually graded and its base reward to the judge
-reply. The OpenCode environment additionally records a bound transformation to
-the full saved transcript and any auxiliary reward. Use
+operation binds the full saved response and final reward, including any tool
+bonus or penalty, to the judge reply. No separate grading transformation is needed. Use
 `judge_server` and model-call capture for qualification. Direct HTTP judging is
 supported for compatibility, but its unobserved judge calls cannot establish a
 fully observed grading record. It is never labeled model-free grading.
 
 An invalid judge reply is not a model mistake. Transport or parsing failures
 preserve the policy response and become masked `judge_failed` outcomes. Direct
-resource-only rows can be rejudged from the saved answer. Historical custom OpenCode environment
-rows require environment-aware replay and are rejected by `gym eval reverify`.
-Stock environment rows with verifier-owned rewards can be rejudged when the
-original configuration and execution evidence are available. If a parsing retry succeeds after an unparseable
+resource-only rows can be rejudged from the saved answer. To regrade tool rewards,
+set `forward_agent_evidence: true` in the reverification configuration so the
+saved trajectory and observations reach the verifier. This is a separate opt-in
+from the Environment Server's setting; reverification defaults to `false`, even
+when saved results contain execution evidence. The grading configuration and
+required execution evidence must remain available. If a parsing retry succeeds after an unparseable
 reply, the score is retained but the grading operation remains `unknown`: an
 invalid reply is not falsely marked as a parsed verdict. Inspect these outcomes
 before claiming complete grading evidence.
@@ -178,17 +179,34 @@ passed or replace these values with a guessed license to bypass it.
 
 ## Training rewards and row profiles
 
+Training profiles using tool rewards must also set `forward_agent_evidence: true`
+on their `single_agent_turn` Environment Server so the verifier receives the
+trajectory and tool observations. Answer-only evaluation leaves it disabled.
+
 The benchmark verifier defaults to `tool_rewards: null` for evaluation. Training
 can enable the existing answer-dependent schedule with `tool_rewards: {}` on the
 Resources server. Scoring reads tool execution outcomes from the shared trajectory
 or observation bundle; it never interprets model-visible output as an exit status.
 
-For existing math, MCQA, and string-match training tasks, select `tool_rewards.py`
-as that Resources server's entrypoint. These thin verifier entrypoints share the
-same reward implementation and retain their existing task schemas and graders.
+For existing math, MCQA, and string-match training tasks, use the
+`opencode_multimodal_benchmarks` Resources component with entrypoint
+`math_with_judge_tool_rewards.py`, `mcqa_tool_rewards.py`, or
+`string_match_tool_rewards.py`, respectively. These thin adapters import the
+existing graders and retain their task schemas. For example:
+
+```yaml
+training_string:
+  resources_servers:
+    opencode_multimodal_benchmarks:
+      entrypoint: string_match_tool_rewards.py
+      tool_rewards: {}
+```
+
+Bind the training Environment Server's `resources_server` to `training_string`
+and set `forward_agent_evidence: true` on that Environment Server.
 Set the schedule on the Resources server, not the agent. Original response messages
 and token arrays are preserved; reasoning cleanup affects only the grading view.
-The stock `single_agent_turn` environment forwards the shared execution evidence.
+The stock `single_agent_turn` environment forwards execution evidence when opted in.
 
 Each row can select a different environment through `task_source`. Bind restricted
 rows to an OpenCode profile with `network_access: model_only`; bind web-enabled rows
