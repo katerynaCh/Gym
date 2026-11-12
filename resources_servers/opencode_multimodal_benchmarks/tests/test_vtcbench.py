@@ -149,3 +149,20 @@ def test_reasoning_cannot_override_final_answer(answer, prediction, options, exp
 
 def test_judge_mcq_verdict_tolerates_surrounding_whitespace():
     assert judge_score({"options": {"A": "cat"}, "answer": "A"}, " A\n") == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("benchmark", ["VStarBench", "HRBench8K", "VTCBench"])
+async def test_unavailable_final_assertion_cannot_credit_an_earlier_option(server, monkeypatch, benchmark):
+    server.config.vtc_llm_fallback = False
+    judge = AsyncMock(return_value="Z")
+    monkeypatch.setattr(VisualBenchmarksServer, "_judge", judge)
+    result = await server.verify(request(benchmark, "answer is A; answer is D", answer="A"))
+    assert result.reward == 0
+    assert result.evaluation_completed is True
+    if benchmark == "VTCBench":
+        assert result.scorer == "vtcbench-final-answer-rules-v4"
+        judge.assert_not_awaited()
+    else:
+        assert result.scorer == "mcq-final-answer-llm-v4"
+        judge.assert_awaited_once()
