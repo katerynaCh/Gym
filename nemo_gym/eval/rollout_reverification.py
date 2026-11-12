@@ -1277,9 +1277,16 @@ def _source_identity_stamps(
                 if task is None or rollout is None:
                     continue
                 source_keys.add((task, rollout))
-                stamps = {key: row[key] for key in _IDENTITY_KEYS if key in row}
+                stamps = {key: row[key] for key in _IDENTITY_KEYS if row.get(key) is not None}
                 if stamps:
-                    stamps_by_key.setdefault((task, rollout), stamps)
+                    saved = stamps_by_key.setdefault((task, rollout), {})
+                    for key, value in stamps.items():
+                        if key in saved and saved[key] != value:
+                            raise ConfigError(
+                                f"Conflicting original rollout identity {(task, rollout)!r} for {key}; "
+                                "nothing was aggregated."
+                            )
+                        saved[key] = value
     return stamps_by_key, source_keys
 
 
@@ -1295,7 +1302,8 @@ def _load_reverified_results(
 
     A row cached by a reverification that did not keep collection's identity stamps gets the stamps its source
     rollout (same task and rollout index, from ``identity_sources``) carries, so a resumed output groups as a fresh
-    one does. Only missing stamps are filled, in memory; the output file is not rewritten. A row whose source
+    one does. Missing or null stamps are filled in memory; the output file is not rewritten. Non-null source and
+    cached stamps must agree. A row whose source
     rollout has no stamp groups as that rollout does. If an unstamped row has no source rollout at all while other
     rows are stamped, its identity cannot be established and aggregating would split one run, so this raises
     ``ConfigError`` before anything is exported or aggregated; the output file keeps every row.
@@ -1303,18 +1311,23 @@ def _load_reverified_results(
     with output_fpath.open("rb") as f:
         results = [orjson.loads(line) for line in f if line.strip()]
     results.sort(key=lambda r: (r[TASK_INDEX_KEY_NAME], r[ROLLOUT_INDEX_KEY_NAME]))
-    if identity_sources and any(key not in r for r in results for key in _IDENTITY_KEYS):
+    if identity_sources:
         stamps_by_key, source_keys = _source_identity_stamps(identity_sources)
         for r in results:
             for key, value in stamps_by_key.get((r[TASK_INDEX_KEY_NAME], r[ROLLOUT_INDEX_KEY_NAME]), {}).items():
-                r.setdefault(key, value)
+                if r.get(key) is not None and r[key] != value:
+                    raise ConfigError(
+                        f"Cached rollout identity {(r[TASK_INDEX_KEY_NAME], r[ROLLOUT_INDEX_KEY_NAME])!r} "
+                        f"conflicts with its original source for {key}; nothing was aggregated."
+                    )
+                r[key] = value
         unresolved = [
             (r[TASK_INDEX_KEY_NAME], r[ROLLOUT_INDEX_KEY_NAME])
             for r in results
-            if ENVIRONMENT_SERVER_STAMP_KEY_NAME not in r
+            if r.get(ENVIRONMENT_SERVER_STAMP_KEY_NAME) is None
             and (r[TASK_INDEX_KEY_NAME], r[ROLLOUT_INDEX_KEY_NAME]) not in source_keys
         ]
-        if unresolved and any(ENVIRONMENT_SERVER_STAMP_KEY_NAME in r for r in results):
+        if unresolved and any(r.get(ENVIRONMENT_SERVER_STAMP_KEY_NAME) is not None for r in results):
             raise ConfigError(
                 f"{len(unresolved)} cached row(s) in {output_fpath} (first (task, rollout): {unresolved[:3]}) have no "
                 "Environment Server stamp and no source rollout to take it from, while the other rows carry one; "

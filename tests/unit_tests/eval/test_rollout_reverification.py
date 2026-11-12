@@ -3244,10 +3244,54 @@ class TestResumeOfOutputCachedWithoutIdentityStamps:
             **overrides,
         )
 
+    @pytest.mark.parametrize("reverse", [False, True])
+    def test_original_identity_merges_complementary_non_null_stamps(self, tmp_path, reverse):
+        from nemo_gym.eval.rollout_reverification import _source_identity_stamps
+
+        paths = (tmp_path / "source-a.jsonl", tmp_path / "source-b.jsonl")
+        self._write(paths[0], [self._key(0) | {"_ng_environment_server": None, "_ng_result_type": "legacy_agent"}])
+        self._write(paths[1], [self._key(0) | {"_ng_environment_server": "env_a", "_ng_result_type": None}])
+        stamps, keys = _source_identity_stamps(tuple(reversed(paths)) if reverse else paths)
+        assert stamps == {(0, 0): self._STAMP}
+        assert keys == {(0, 0)}
+
+    @pytest.mark.parametrize("reverse", [False, True])
+    def test_conflicting_original_identity_never_uses_file_order(self, tmp_path, reverse):
+        from nemo_gym.eval.rollout_reverification import _source_identity_stamps
+
+        paths = (tmp_path / "source-a.jsonl", tmp_path / "source-b.jsonl")
+        for path, environment in zip(paths, ("env_a", "env_b"), strict=True):
+            self._write(path, [self._key(0) | {"_ng_environment_server": environment}])
+        with pytest.raises(ConfigError, match="Conflicting original rollout identity"):
+            _source_identity_stamps(tuple(reversed(paths)) if reverse else paths)
+
+    @pytest.mark.parametrize("key,bad_value", [("_ng_environment_server", "env_b"), ("_ng_result_type", "other")])
+    async def test_cached_original_identity_conflict_stops_before_aggregation(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, key: str, bad_value: str
+    ) -> None:
+        cached = self._fixture(tmp_path, source_stamp=self._STAMP, cached_tasks=[0, 1, 2, 3])
+        cached = [row | self._STAMP for row in cached]
+        cached[0][key] = bad_value
+        output = tmp_path / "output.jsonl"
+        self._write(output, cached)
+        original = output.read_bytes()
+        dispatched, posted = [], []
+        self._patch(monkeypatch, dispatched, posted)
+
+        with pytest.raises(ConfigError, match="conflicts with its original source"):
+            await RolloutReverificationHelper().run_from_config(self._config(tmp_path, resume=True))
+
+        assert dispatched == posted == []
+        assert output.read_bytes() == original
+
+    @pytest.mark.parametrize("null_stamps", [False, True])
     async def test_cached_rows_take_their_source_stamps_and_group_with_the_new_rows(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, null_stamps: bool
     ) -> None:
         cached = self._fixture(tmp_path, source_stamp=self._STAMP, cached_tasks=[0, 1])
+        if null_stamps:
+            cached = [row | {key: None for key in self._STAMP} for row in cached]
+            self._write(tmp_path / "output.jsonl", cached)
         on_disk = (tmp_path / "output.jsonl").read_bytes()
         dispatched, posted = [], []
         self._patch(monkeypatch, dispatched, posted)
@@ -3317,12 +3361,16 @@ class TestResumeOfOutputCachedWithoutIdentityStamps:
         assert posted == [[0, 1, 2, 3]]
         assert not any("_ng_environment_server" in r or "_ng_result_type" in r for r in returned)
 
+    @pytest.mark.parametrize("null_stamps", [False, True])
     async def test_a_cached_row_without_a_source_rollout_stops_before_export_and_aggregation(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, null_stamps: bool
     ) -> None:
         """No identity is guessed and no split group is aggregated: the run stops with the remedy, and the output
         keeps every row with its verdict."""
         cached = self._fixture(tmp_path, source_stamp=self._STAMP, cached_tasks=[0, 1], drop_source=0)
+        if null_stamps:
+            cached[0].update({key: None for key in self._STAMP})
+            self._write(tmp_path / "output.jsonl", cached)
         on_disk = (tmp_path / "output.jsonl").read_bytes()
         dispatched, posted = [], []
         self._patch(monkeypatch, dispatched, posted)
@@ -3342,18 +3390,22 @@ class TestResumeOfOutputCachedWithoutIdentityStamps:
         assert (tmp_path / "output.jsonl").read_bytes().startswith(on_disk) and rows[:2] == cached
         assert sorted(r[TASK_INDEX_KEY_NAME] for r in rows) == [0, 1, 2, 3]
 
+    @pytest.mark.parametrize("null_stamps", [False, True])
     async def test_cached_rows_without_any_stamp_still_aggregate_when_a_source_rollout_is_gone(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, null_stamps: bool
     ) -> None:
         """An unstamped run stays one group by agent even if a source rollout is gone: nothing to split."""
-        self._fixture(tmp_path, source_stamp={}, cached_tasks=[0, 1], drop_source=0)
+        cached = self._fixture(tmp_path, source_stamp={}, cached_tasks=[0, 1], drop_source=0)
+        if null_stamps:
+            cached = [row | {key: None for key in self._STAMP} for row in cached]
+            self._write(tmp_path / "output.jsonl", cached)
         dispatched, posted = [], []
         self._patch(monkeypatch, dispatched, posted)
 
         returned = await RolloutReverificationHelper().run_from_config(self._config(tmp_path, resume=True))
 
         assert posted == [[0, 1, 2, 3]]
-        assert not any("_ng_environment_server" in r for r in returned)
+        assert all(r.get("_ng_environment_server") is None for r in returned)
 
 
 class TestRunFromConfigJudgeFailedOnly:
