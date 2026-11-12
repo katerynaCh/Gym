@@ -63,10 +63,13 @@ from nemo_gym.agents import (
 from nemo_gym.client import get_response_json, raise_for_status
 from nemo_gym.config import ModelServerRef, ResourcesServerRef, get_global_config_dict
 from nemo_gym.core import (
+    AGENT_LIMIT,
     AGENT_ROUTE_FAILED,
     MODEL_CONTEXT_LIMIT,
     MODEL_REQUEST_ERROR,
     MODEL_TRANSPORT_ERROR,
+    FailureBoundary,
+    FailureReport,
     MediaFile,
     NeMoGymEasyInputMessage,
     NeMoGymFunctionCallOutput,
@@ -81,9 +84,11 @@ from nemo_gym.core import (
     NgFailureEvent,
     SandboxFailureDetails,
     UnsupportedContentError,
+    failure_report_for,
     observe_failure,
     split_text_and_media,
 )
+from nemo_gym.models import model_turn_limit_details
 from nemo_gym.sandbox import (
     AsyncSandbox,
     DirectSandboxConnection,
@@ -275,12 +280,17 @@ def _private_directories(root: str) -> dict[str, str]:
     }
 
 
-def _without_empty_tools(opencode_config: dict[str, Any]) -> dict[str, Any]:
-    """Drop a null or empty ``tools`` map so ``permission`` is the only rule source, exactly as given.
+def _opencode_options(opencode_config: dict[str, Any]) -> dict[str, Any]:
+    """Omit empty tools and an explicitly cleared step limit from the OpenCode configuration.
 
     OpenCode 1.17.11 turns ``tools`` into base permission rules and merges ``permission`` on top.
     """
-    return {key: value for key, value in opencode_config.items() if key != "tools" or value}
+    options = {key: copy.deepcopy(value) for key, value in opencode_config.items() if key != "tools" or value}
+    agent = options.get("agent")
+    build = agent.get("build") if isinstance(agent, dict) else None
+    if isinstance(build, dict) and build.get("steps", False) is None:
+        build.pop("steps")
+    return options
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -332,7 +342,7 @@ def _session_opencode_config_error(opencode_config: Mapping[str, Any]) -> str | 
     - ``compaction.auto`` (a boolean). Automatic compaction summarizes the session and continues from the
       summary, in model calls that do not extend the scored call's prefix. With it off, a run that fills the
       context ends with OpenCode's context-overflow error, which the adapter reports as a context limit.
-    - ``agent.build.steps`` (a positive integer): the step limit of OpenCode's ``build`` agent, which the session
+    - ``agent.build.steps`` (a positive integer or null to clear an inherited limit): OpenCode's ``build`` agent limit
       runs, for each prompt. From the call at the limit on, OpenCode adds an assistant message to each request that
       asks for a text answer. It still offers the tools, so a model that keeps calling them runs past the limit.
       Other agent fields would replace the adapter's prompt, model or sampling. Token capture recognizes that
@@ -355,8 +365,8 @@ def _session_opencode_config_error(opencode_config: Mapping[str, Any]) -> str | 
     build = agent.get("build", {})
     if not isinstance(build, Mapping) or build.keys() - {"steps"}:
         return "agent.build supports only steps"
-    if "steps" in build and (type(build["steps"]) is not int or build["steps"] <= 0):
-        return "agent.build.steps must be a positive integer"
+    if "steps" in build and build["steps"] is not None and (type(build["steps"]) is not int or build["steps"] <= 0):
+        return "agent.build.steps must be a positive integer or null"
     return None
 
 
@@ -561,6 +571,8 @@ class OpenCodeAgent(SimpleResponsesAPIAgent):
             return AgentOutcome(failure_kind="unknown")
         data = error.get("data") or {}
         status = data.get("statusCode")
+        if model_turn_limit_details(status_code=status, response_body=data.get("responseBody")) is not None:
+            return AgentOutcome(failure_kind=AGENT_LIMIT)
         if type(status) is int and 400 <= status <= 599:
             return AgentOutcome(failure_kind=MODEL_REQUEST_ERROR, status_code=status)
         if status is None and data.get("isRetryable") is True:
@@ -640,7 +652,7 @@ class OpenCodeAgent(SimpleResponsesAPIAgent):
         return f"nemo/{self.config.model}" if self.config.model_server else self.config.model
 
     def _build_opencode_config(self, rollout_id: Optional[str] = None) -> dict[str, Any]:
-        config = self._deep_merge({}, copy.deepcopy(_without_empty_tools(self.config.opencode_config)))
+        config = self._deep_merge({}, _opencode_options(self.config.opencode_config))
         if self.config.model_server:
             providers = config.setdefault("provider", {})
             nemo = providers.setdefault("nemo", {"npm": "@ai-sdk/openai-compatible"})
@@ -1776,7 +1788,7 @@ class OpenCodeAgent(SimpleResponsesAPIAgent):
             },
             # A copy: the replacement prompt and the request sampling below are per session and must not reach
             # the shared configuration.
-            **copy.deepcopy(_without_empty_tools(self.config.opencode_config)),
+            **_opencode_options(self.config.opencode_config),
         }
         sampling = {name: value for name in ("temperature", "top_p") if (value := getattr(body, name)) is not None}
         if sampling:
@@ -1929,6 +1941,7 @@ class OpenCodeAgent(SimpleResponsesAPIAgent):
         native_result = assistants[-1] if assistants else {}
         reported_error = error is None and failure is None and self._reported_model_error(native_result, result)
         context_limit = reported_error and (native_result.get("error") or {}).get("name") == _CONTEXT_OVERFLOW_ERROR
+        budget_limit = reported_error and self.classify_outcome(native_result).failure_kind == AGENT_LIMIT
         runtime = state.runtime_info
         if runtime is None:
             observations.gaps.append(ObservationGap(code="runtime_info_unavailable"))
@@ -1973,6 +1986,9 @@ class OpenCodeAgent(SimpleResponsesAPIAgent):
                     record.error_type = "cancelled"
                 elif context_limit:
                     record.error_type = "context_limit"
+                elif budget_limit:
+                    record.error_type = "agent_limit"
+                    record.stop_reason = "model_turn_budget"
                 elif reported_error:
                     record.error_type = "provider_error"
                 elif error or failure:
@@ -1998,7 +2014,9 @@ class OpenCodeAgent(SimpleResponsesAPIAgent):
                     outcome=sandbox_outcome,
                     exit_code=result["return_code"] if not timed_out else None,
                     # The same category the root invocation carries for the stop or failure.
-                    error_type="process_exit"
+                    error_type="agent_limit"
+                    if budget_limit
+                    else "process_exit"
                     if reported_error
                     else {"cancelled": "cancelled", "failed": "server_error"}.get(sandbox_outcome),
                 )
@@ -2044,6 +2062,15 @@ class OpenCodeAgent(SimpleResponsesAPIAgent):
             raise failure
         if error and not reported_error:
             raise HTTPException(502, format_error_message(error, stderr=state.stderr))
+        budget_failure = None
+        if budget_limit:
+            budget_failure = NgFailureEvent(
+                boundary=FailureBoundary.AGENT,
+                failure_kind=AGENT_LIMIT,
+                failure_reason="Successful model-request turn limit reached",
+                operation="agent.model_turn_budget",
+            )
+            observe_failure(budget_failure)
         reported_message = None
         if reported_error and not context_limit:
             error_data = native_result["error"].get("data") or {}
@@ -2063,6 +2090,12 @@ class OpenCodeAgent(SimpleResponsesAPIAgent):
             usage=usage,
             error_message=reported_message,
         )
+        if budget_failure is not None:
+            report = failure_report_for(budget_failure)
+            saved_report = getattr(response, "failure_report", None)
+            if saved_report is not None:
+                report = report.merged(FailureReport.model_validate(saved_report))
+            response = response.model_copy(update={"failure_report": report.model_dump(mode="json")})
         if reached_step_limit(export, _build_step_limit(config)):
             # The environment decides whether an answer given at or after the step limit is scored.
             response = response.model_copy(

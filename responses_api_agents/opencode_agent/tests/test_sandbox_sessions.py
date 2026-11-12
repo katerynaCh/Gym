@@ -1074,6 +1074,24 @@ def test_compaction_and_build_steps_reach_opencode(setup, mode):
     assert agent.config.opencode_config == {"compaction": {"auto": False}, "agent": {"build": {"steps": 8}}}
 
 
+def test_null_build_steps_clear_the_advisory_limit_without_changing_prompt_or_sampling(setup):
+    agent, sandbox = setup
+    agent.config.system_prompt_mode = "replace"
+    agent.config.system_prompt = "Answer briefly"
+    agent.config.opencode_config = {"compaction": {"auto": False}, "agent": {"build": {"steps": None}}}
+    with TestClient(agent.setup_webserver()) as client:
+        created = client.post("/v1/agent_sessions", json=seed().model_dump(mode="json"))
+        assert created.status_code == 200, created.text
+        result = client.post("/ng-rollout/opencode-smoke-a2/v1/responses", json={"input": "task", "temperature": 0.6})
+        assert result.status_code == 200, result.text
+        config = json.loads(sandbox.params()["env"]["OPENCODE_CONFIG_CONTENT"])
+        assert config["agent"]["build"] == {"prompt": "Answer briefly", "temperature": 0.6}
+        assert config["compaction"] == {"auto": False}
+        assert result.json()["metadata"].get("harness_step_limit_reached") is None
+        client.post("/v1/agent_sessions/close", json=close_body(created.json()["agent_session_id"]))
+    assert agent.config.opencode_config["agent"]["build"]["steps"] is None
+
+
 def test_request_sampling_joins_the_configured_build_steps(setup):
     agent, sandbox = setup
     agent.config.opencode_config = {"agent": {"build": {"steps": 8}}}
@@ -2494,6 +2512,57 @@ async def test_native_model_error_is_reported_with_classification(setup, status)
     )
     assert json.loads(response.metadata["ng_agent_outcome"]) == expected
     await agent.close_agent_session(request, AgentCloseSessionRequest(**close_body(session_id)))
+
+
+@pytest.mark.parametrize(
+    "code,expected", [("nemo_gym_turn_budget_exhausted", "agent_limit"), ("provider_refusal", "model_request_error")]
+)
+def test_native_budget_stop_has_matching_typed_failure_evidence(setup, code, expected):
+    agent, sandbox = setup
+    export = json.loads(sandbox.events)
+    assistant = export["messages"][-1]["info"]
+    assistant.pop("finish")
+    assistant["error"] = {
+        "name": "APIError",
+        "data": {
+            "statusCode": 422,
+            "message": "model request refused",
+            "responseBody": json.dumps({"detail": {"code": code, "successful_requests": 65, "hard_limit": 65}}),
+        },
+    }
+    sandbox.events = json.dumps(export)
+    sandbox.result["return_code"] = 1
+    app = agent.setup_webserver()
+    agent.setup_exception_middleware(app)
+    with TestClient(app) as client:
+        created = client.post("/v1/agent_sessions", json=seed().model_dump(mode="json"))
+        assert created.status_code == 200, created.text
+        response = client.post("/ng-rollout/opencode-smoke-a2/v1/responses", json={"input": "task"})
+        assert response.status_code == 200, response.text
+        body = response.json()
+        expected_outcome = {"failure_kind": expected}
+        if expected == "model_request_error":
+            expected_outcome["status_code"] = 422
+        assert json.loads(body["metadata"]["ng_agent_outcome"]) == expected_outcome
+        if expected == "agent_limit":
+            report = body["failure_report"]
+            selected = report["events"][report["failure_id"]]
+            assert selected["failure_kind"] == "agent_limit"
+            assert selected["boundary"] == "agent"
+            assert selected.get("http_status") is None
+            from tests.helpers.single_agent_turn import _environment_server, _request, _Response
+
+            environment, boundary = _environment_server()
+            boundary.responses[2] = _Response(body)
+            with TestClient(environment.setup_webserver()) as environment_client:
+                verified = environment_client.post("/run", json=_request().model_dump(mode="json"))
+            assert verified.status_code == 200, verified.text
+            assert verified.json()["failure"] is None
+            assert verified.json()["result"]["reward"] == 1.0
+            verification_requests = [kwargs for _, url, kwargs in boundary.calls if url == "/verify"]
+            assert len(verification_requests) == 1
+            assert verification_requests[0]["json"]["response"]["output"] == body["output"]
+        client.post("/v1/agent_sessions/close", json=close_body(created.json()["agent_session_id"]))
 
 
 @pytest.mark.parametrize("message", [None, "", {"responseBody": "private-body"}])

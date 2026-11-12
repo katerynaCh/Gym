@@ -108,7 +108,7 @@ class CaptureContext:
     model: str = ""
     # ``commit_entry`` sets this after another capture path records the call.
     committed: bool = False
-    # A worker acknowledged refusal before generation/staging and the ledger settled its intent.
+    # The model server or worker confirmed refusal before generation/staging; the ledger settled its intent.
     refused: bool = False
     # Store resolved continuations as parent-relative suffixes.
     delta_records: bool = False
@@ -489,6 +489,39 @@ async def register_call_intent() -> None:
         return
     await begin(context.capture_key, context.model_call_id)
     context.intent_registered = True
+
+
+async def capture_model_refusal(*, code: str, upstream_attempted: bool) -> None:
+    """Settle an adapter-owned refusal made before upstream dispatch.
+
+    Call only when the model adapter itself has decided not to send the request. ``upstream_attempted``
+    is the adapter's own execution fact, never a header, body field or provider status. Under external
+    custody an intent and prepared admission may exist, but no upstream dispatch or response may exist;
+    the ledger retains the refusal without inventing a worker acknowledgement. Local capture retains
+    the typed refusal through its existing sink extension.
+    Failure to settle leaves the intent pending, so capture remains fail-closed.
+    """
+    context = _CAPTURE_CONTEXT.get()
+    if context is None:
+        return
+    if upstream_attempted is not False or context.committed or context.external_worker_response_seen:
+        logger.error("Cannot settle an adapter-owned refusal after upstream dispatch or response")
+        return
+    if not context.external_staging:
+        await capture_engine_refusal(code)
+        return
+    if not context.intent_registered:
+        return
+    refuse = getattr(context.lineage_store, "refuse_call", None)
+    if refuse is None:
+        logger.error("Capture ledger cannot settle an adapter-owned refusal; the intent remains pending")
+        return
+    try:
+        await refuse(context.capture_key, context.model_call_id)
+        context.refused = True
+    except Exception:
+        # The caller must still receive its typed refusal; an unsettled intent prevents a false complete capture.
+        logger.warning("Could not settle an adapter-owned pre-generation refusal", exc_info=True)
 
 
 async def capture_engine_refusal(code: str | None) -> None:

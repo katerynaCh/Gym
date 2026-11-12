@@ -219,7 +219,8 @@ class CaptureLedger(LineageResolver, Protocol):
     existing intents may still commit. These extensions do not freeze writes.
 
     ``refuse_call(rollout_id, model_call_id)`` optionally settles an intent after
-    the worker acknowledges a refusal before generation or staging. Such calls
+    the model adapter itself refuses before upstream dispatch, or the worker acknowledges a refusal
+    before generation or staging. Such calls
     remain in the audit ledger but are excluded from the training manifest.
     An error status or message alone is not this acknowledgement.
     """
